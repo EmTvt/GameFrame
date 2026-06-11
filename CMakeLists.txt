@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.10)
+
+# 项目名
+project(epoll_proj LANGUAGES CXX)
+
+# C++ 标准
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+
+# 默认 Debug 构建（带调试符号），方便 VSCode 调试
+if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Debug)
+endif()
+
+# 导出 compile_commands.json，便于 clangd / IntelliSense 使用
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# 编译选项
+add_compile_options(-Wall -Wextra)
+
+# 可执行目标
+add_executable(epoll_proj main.cpp)
