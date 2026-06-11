@@ -20,4 +20,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-Wall -Wextra)
 
 # 可执行目标
-add_executable(epoll_proj main.cpp)
+add_executable(epoll_proj
+    main.cpp
+    src/connection.cpp
+    src/server.cpp
+)
+
+# 头文件搜索路径（让 #include "src/xxx.h" 和 #include "xxx.h" 都能工作）
+target_include_directories(epoll_proj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
