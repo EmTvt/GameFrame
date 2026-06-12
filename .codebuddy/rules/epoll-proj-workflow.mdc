@@ -1,0 +1,92 @@
+---
+description: 
+alwaysApply: true
+enabled: true
+updatedAt: 2026-06-12T07:24:27.166Z
+provider: 
+---
+
+# epoll_proj 项目工作规范（always）
+
+> 本规则在每次对话中自动注入。处理 `epoll_proj` 项目任务时必须遵守。
+
+---
+
+## 一、项目背景（30 秒速览）
+
+- **性质**：教学性质的 Linux epoll TCP 框架（muduo 简化版）
+- **技术栈**：C++20 + CMake + 单线程 epoll(ET) + 非阻塞 I/O，**禁止引入 Boost / muduo / asio 等外部依赖**
+- **当前阶段**：第二步 —— 已具备 Buffer + Connection（读循环 / 写快路径 + EPOLLOUT 兜底）+ TcpServer
+- **代码入口**：`main.cpp`（演示 echo 服务）；核心代码在 `src/`
+
+---
+
+## 二、强制工作流
+
+接到本项目任务时，**严格按以下顺序执行**：
+
+### 1. 起手：读路由
+
+无论任务大小，**先 `read_file /data/workspace/epoll_proj/CLAUDE.md`**，确认：
+- 当前项目处于哪一步演进阶段
+- 该任务对应的 SKILL / RULE 文件路径
+
+### 2. 按任务类型加载对应子文档
+
+| 任务关键词 | 必读文件 |
+|---|---|
+| 编译 / 运行 / 调试 | `CLAUDE/SKILLS/build-and-run.md` |
+| 加新协议（HTTP / 长度前缀 / 行协议） | `CLAUDE/SKILLS/add-protocol.md` |
+| 扩展框架能力（水位线 / 定时器 / context 挂载） | `CLAUDE/SKILLS/extend-framework.md` |
+| 排查运行时问题（连接卡住 / 内存涨 / 数据丢失） | `CLAUDE/SKILLS/debug-runtime.md` |
+| 涉及 `Connection` / `Server` / fd 生命周期 | **必读** `CLAUDE/RULES/resource-safety.md` |
+| 修改任何 public 回调签名 / 接口 | **必读** `CLAUDE/RULES/api-stability.md` |
+| 写新代码 | 参考 `CLAUDE/RULES/coding-style.md` |
+
+**未读对应 RULES 之前，不得动 `Connection` / `Server` 的核心逻辑**。
+
+### 3. 动手前给出"改动计划"
+
+非琐碎改动（>20 行 或 触碰核心类）必须先用一段话说明：
+- 改哪几个文件、改什么
+- 为什么这么改（贴 RULES 里的依据）
+- 可能的影响面
+
+让用户确认或顺势开干，但**不要在没说明计划的情况下大段改写**。
+
+### 4. 改动方式
+
+- 优先 `replace_in_file` 做局部修改
+- **禁止用 `write_to_file` 整体重写已有文件**，除非用户明确要求
+- 每次改完，给一行 build 验证命令：`cmake --build /data/workspace/epoll_proj/build -j`
+
+---
+
+## 三、硬性约束（红线）
+
+| # | 红线 | 违反后果 |
+|---|---|---|
+| 1 | 不引入外部依赖（仅允许标准库 + Linux syscall） | 破坏教学项目纯净性 |
+| 2 | `Connection::close()` 后**不清零 `fd_`**（业务回调需要它做日志） | 破坏对外契约 |
+| 3 | `Server::handle_event` 处理完读后**必须二次检查 `connections_.count(fd)`**（连接可能在回调里被关） | UAF |
+| 4 | epoll 一律用 `EPOLLET` + 读循环到 `EAGAIN` | ET 漏读会卡死 |
+| 5 | 不在框架层调 `conn.close()` 之外的方式关 fd（绕过状态机会乱） | 状态机失效 |
+| 6 | 写新代码用 C++20，但**避免 coroutines / modules** 等会让教学项目变复杂的特性 | 偏离定位 |
+
+---
+
+## 四、沟通风格
+
+- **中文回答**
+- 重点说**为什么**，不只是**做了什么**
+- 代码注释同上
+- 不要为了显得勤奋而大段重复用户已知的事实
+
+---
+
+## 五、不确定时怎么办
+
+- 涉及"现在做到哪一步" → 看 `CLAUDE.md` 第 3 节
+- 涉及"下一步该做什么" → 看 `CLAUDE.md` 第 6 节"演进路线"
+- 涉及"为什么之前这么设计" → 看 `CLAUDE/RULES/resource-safety.md` 和 `api-stability.md`，里面有历史决策依据
+- 都查不到 → 问用户，**不要瞎猜**
