@@ -32,3 +32,18 @@ target_include_directories(epoll_proj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
+
+# 链接 pthread（EventLoop 用了 std::thread / std::mutex；Linux 上需要 pthread）
+find_package(Threads REQUIRED)
+target_link_libraries(epoll_proj PRIVATE Threads::Threads)
+
+# ---- 测试：EventLoop 跨线程能力 ----
+add_executable(test_event_loop
+    test_event_loop.cpp
+    src/event_loop.cpp
+)
+target_include_directories(test_event_loop PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_event_loop PRIVATE Threads::Threads)
