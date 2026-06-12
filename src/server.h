@@ -1,9 +1,11 @@
-// TcpServer: 基于 epoll 的多客户端 TCP 服务器
+// TcpServer: 基于 EventLoop 的多客户端 TCP 服务器
 //
-// 第二步新增：
-//   - 处理 EPOLLOUT 事件（分发到 Connection::handle_write）
-//   - 暴露 update_events 接口给 Connection 用于动态开关 EPOLLOUT
-//   - Connection::close 时记下 fd 由 Server 统一处理 epoll DEL，不再"遍历找对象"
+// 拆分动作（第六步预备）：
+//   - epoll 的创建 / wait / ctl 全部下沉到 EventLoop
+//   - TcpServer 只负责：监听 socket、accept、Connection 生命周期管理
+//   - 通过向 EventLoop 注册"fd → 事件回调"挂上自己
+//
+// Connection 的接口完全不变，所以这次拆分对业务代码（main.cpp）零影响。
 
 #pragma once
 
@@ -12,6 +14,7 @@
 #include <unordered_map>
 
 #include "connection.h"
+#include "event_loop.h"
 
 namespace epoll_proj {
 
@@ -32,12 +35,14 @@ public:
 private:
     void create_listen_socket();
     void handle_accept();
-    void remove_connection(int fd);                  // 由 Connection 关闭时回调
-    void update_events(int fd, uint32_t events);     // 由 Connection 调整关注事件
+    void handle_conn_event(int fd, uint32_t events);  // 单个连接 fd 的事件分发
+    void remove_connection(int fd);                   // 由 Connection 关闭时回调
+    void update_events(int fd, uint32_t events);      // 由 Connection 调整关注事件
 
     uint16_t port_;
     int listen_fd_ = -1;
-    int epfd_ = -1;
+
+    EventLoop loop_;
 
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
 

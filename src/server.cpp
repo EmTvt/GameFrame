@@ -17,7 +17,6 @@ namespace epoll_proj {
 namespace {
 
 constexpr int kBacklog = 128;
-constexpr int kMaxEvents = 64;
 
 [[noreturn]] void die(const char* msg) {
     std::cerr << msg << " failed: " << std::strerror(errno) << std::endl;
@@ -30,37 +29,30 @@ bool set_nonblocking(int fd) {
     return ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-bool epoll_add(int epfd, int fd, uint32_t events) {
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.fd = fd;
-    return ::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0;
-}
-
-bool epoll_mod(int epfd, int fd, uint32_t events) {
-    epoll_event ev{};
-    ev.events = events;
-    ev.data.fd = fd;
-    return ::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
-}
-
 }  // namespace
 
 TcpServer::TcpServer(uint16_t port) : port_(port) {
     create_listen_socket();
 
-    epfd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (epfd_ < 0) die("epoll_create1");
-
-    if (!epoll_add(epfd_, listen_fd_, EPOLLIN | EPOLLET)) {
-        die("epoll_ctl(listen_fd)");
-    }
+    // 把 listen_fd 挂到 EventLoop 上：来事件就调 handle_accept
+    // 事件位掩码这里其实用不上（listen socket 只关心 EPOLLIN），但保留参数让回调签名统一
+    loop_.add_fd(listen_fd_, EPOLLIN | EPOLLET, [this](uint32_t ev) {
+        if (ev & (EPOLLERR | EPOLLHUP)) {
+            std::cerr << "[server] listen_fd error/hup, exiting." << std::endl;
+            std::exit(EXIT_FAILURE);
+        }
+        handle_accept();
+    });
 }
 
 TcpServer::~TcpServer() {
+    // 先清空 connections_，Connection 析构会 ::close(fd)；
+    // 此时 loop_ 还活着、loop_.del_fd 也能正常工作，但我们不在 Connection 析构里调它 ——
+    //   Connection 不感知 EventLoop 的存在（保持对外接口干净）。
+    // 由于 epfd 即将被 loop_ 析构关掉，残留的 fd 关注关系会随 epfd 一起释放，没有泄漏。
     connections_.clear();
     if (listen_fd_ >= 0) ::close(listen_fd_);
-    if (epfd_ >= 0) ::close(epfd_);
+    // epfd_ 由 loop_ 自己负责，不需要这里关
 }
 
 void TcpServer::create_listen_socket() {
@@ -105,23 +97,21 @@ void TcpServer::handle_accept() {
             continue;
         }
 
-        if (!epoll_add(epfd_, conn_fd, EPOLLIN | EPOLLET)) {
-            std::cerr << "[server] epoll_ctl ADD failed for fd=" << conn_fd
-                      << ": " << std::strerror(errno) << std::endl;
-            ::close(conn_fd);
-            continue;
-        }
-
         auto conn = std::make_unique<Connection>(conn_fd, client_addr);
         if (message_cb_) conn->set_message_callback(message_cb_);
         // close 回调：Connection::close() 调用时 fd_ 仍然保留（不会被置为 -1），
-        // 所以这里直接用 c.fd() 即可，语义比之前"捕获 conn_fd"更直观。
+        // 所以这里直接用 c.fd() 即可。
         conn->set_close_callback([this](Connection& c) {
             remove_connection(c.fd());
         });
         // 事件更新回调：Connection 想开/关 EPOLLOUT 时通过它通知 Server
         conn->set_update_events_callback([this](Connection& c, uint32_t events) {
             update_events(c.fd(), events);
+        });
+
+        // 注册到事件循环
+        loop_.add_fd(conn_fd, EPOLLIN | EPOLLET, [this, conn_fd](uint32_t ev) {
+            handle_conn_event(conn_fd, ev);
         });
 
         std::cout << "[server] new client fd=" << conn_fd
@@ -132,11 +122,35 @@ void TcpServer::handle_accept() {
     }
 }
 
+void TcpServer::handle_conn_event(int fd, uint32_t ev) {
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) return;  // 防御：连接可能已被关闭
+    Connection& conn = *it->second;
+
+    // 错误优先：直接关闭
+    if (ev & (EPOLLERR | EPOLLHUP)) {
+        conn.close();
+        return;
+    }
+    // 可读
+    if (ev & EPOLLIN) {
+        conn.handle_read();
+        // resource-safety.md 第 4 节：业务回调可能已经 close()，再次确认
+        // 注意：本检查必须保留 —— 否则下面 handle_write 是 UAF
+        if (!connections_.count(fd)) return;
+    }
+    // 可写
+    if (ev & EPOLLOUT) {
+        conn.handle_write();
+    }
+}
+
 void TcpServer::remove_connection(int fd) {
     auto it = connections_.find(fd);
     if (it == connections_.end()) return;
 
-    ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
+    // 先从 epoll 注销，再 erase（unique_ptr 析构会 close fd）
+    loop_.del_fd(fd);
     std::cout << "[server] client closed fd=" << fd
               << " (" << it->second->peer() << "), remaining="
               << (connections_.size() - 1) << std::endl;
@@ -144,61 +158,12 @@ void TcpServer::remove_connection(int fd) {
 }
 
 void TcpServer::update_events(int fd, uint32_t events) {
-    if (!epoll_mod(epfd_, fd, events)) {
-        std::cerr << "[server] epoll_ctl MOD failed for fd=" << fd
-                  << ": " << std::strerror(errno) << std::endl;
-    }
+    loop_.mod_fd(fd, events);
 }
 
 void TcpServer::run() {
-    std::cout << "[server] epoll server listening on 0.0.0.0:" << port_
-              << " (max_events=" << kMaxEvents << ")" << std::endl;
-
-    epoll_event events[kMaxEvents];
-    while (true) {
-        int nready = ::epoll_wait(epfd_, events, kMaxEvents, -1);
-        if (nready < 0) {
-            if (errno == EINTR) continue;
-            die("epoll_wait");
-        }
-
-        for (int i = 0; i < nready; ++i) {
-            int fd = events[i].data.fd;
-            uint32_t ev = events[i].events;
-
-            if (fd == listen_fd_) {
-                if (ev & (EPOLLERR | EPOLLHUP)) {
-                    std::cerr << "[server] listen_fd error/hup, exiting." << std::endl;
-                    std::exit(EXIT_FAILURE);
-                }
-                handle_accept();
-                continue;
-            }
-
-            auto it = connections_.find(fd);
-            if (it == connections_.end()) {
-                ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
-                continue;
-            }
-            Connection& conn = *it->second;
-
-            // 错误优先：直接关闭
-            if (ev & (EPOLLERR | EPOLLHUP)) {
-                conn.close();
-                continue;
-            }
-            // 可读
-            if (ev & EPOLLIN) {
-                conn.handle_read();
-                // 业务回调中可能已经 close()，再次确认
-                if (!connections_.count(fd)) continue;
-            }
-            // 可写
-            if (ev & EPOLLOUT) {
-                conn.handle_write();
-            }
-        }
-    }
+    std::cout << "[server] epoll server listening on 0.0.0.0:" << port_ << std::endl;
+    loop_.loop();
 }
 
 }  // namespace epoll_proj

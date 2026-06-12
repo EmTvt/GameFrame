@@ -23,6 +23,7 @@ add_compile_options(-Wall -Wextra)
 add_executable(epoll_proj
     main.cpp
     src/connection.cpp
+    src/event_loop.cpp
     src/server.cpp
 )
 
