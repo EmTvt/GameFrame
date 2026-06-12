@@ -1,16 +1,15 @@
-// Connection: 单个 TCP 连接的抽象
+// Connection: 单个 TCP 连接的抽象（第二步：引入读/写缓冲区）
 //
-// 当前职责（第一步重构，先做最小可用版本）：
-//   - 持有 conn_fd 与对端地址信息（ip:port）
-//   - 维护连接状态（连接中 / 已断开）
-//   - 封装 read / send / close 系统调用，对上层屏蔽 errno 细节
-//   - 通过回调把"收到数据后怎么处理"交给业务层（解耦 I/O 与业务）
+// 本步新增能力：
+//   - input_buffer_ ：内核数据先 read 到这里，业务从 buffer 里按协议解析消息
+//   - output_buffer_：业务 send 写不完的数据暂存这里，等 EPOLLOUT 再继续发
+//   - handle_write()：被 Server 在 EPOLLOUT 触发时调用
+//   - 通过 update_events_cb_ 通知 Server 修改 epoll 关注的事件（开/关 EPOLLOUT）
 //
-// 后续步骤会扩展：
-//   - 读缓冲区 / 写缓冲区
-//   - EPOLLOUT 管理（write 不完时的暂存）
-//   - 协议解析（粘包/拆包）
-//   - 空闲超时
+// 业务回调签名变更：
+//   旧：void(Connection&, std::string_view)   一次给完
+//   新：void(Connection&, Buffer&)             业务自己决定消费多少
+//   原因：协议解析需要"看到不完整数据时不消费，等下次拼起来"
 
 #pragma once
 
@@ -22,65 +21,74 @@
 #include <string>
 #include <string_view>
 
+#include "buffer.h"
+
 namespace epoll_proj {
 
 class Connection {
 public:
     enum class State {
-        kConnected,    // 已连接，可读写
-        kDisconnected, // 已关闭，等待回收
+        kConnected,
+        kDisconnected,
     };
 
-    // 收到数据时的回调签名：
-    //   conn ：当前连接对象（业务可用它回写、关闭）
-    //   data ：本次读取到的字节数据（注意 TCP 流式，可能是半个包）
-    using MessageCallback = std::function<void(Connection& conn, std::string_view data)>;
+    using MessageCallback = std::function<void(Connection& conn, Buffer& input)>;
+    using CloseCallback   = std::function<void(Connection& conn)>;
+    // 通知 Server 修改本连接在 epoll 上关注的事件位（如开关 EPOLLOUT）
+    using UpdateEventsCallback = std::function<void(Connection& conn, uint32_t events)>;
 
-    // 关闭事件回调（对端关闭 / 出错时由 Connection 通知给上层 Server 移除自己）
-    using CloseCallback = std::function<void(Connection& conn)>;
-
-    // 构造：托管一个已经 accept 出来的 conn_fd（应该是非阻塞的）
     Connection(int fd, const sockaddr_in& peer_addr);
+    ~Connection();
 
-    // 禁止拷贝（持有 fd 资源），允许移动也不必要，直接禁止
     Connection(const Connection&) = delete;
     Connection& operator=(const Connection&) = delete;
 
-    // 析构：若仍持有 fd 则 close，避免泄漏
-    ~Connection();
-
-    // ===== 基本访问器 =====
     int fd() const { return fd_; }
     State state() const { return state_; }
     bool connected() const { return state_ == State::kConnected; }
-    const std::string& peer() const { return peer_; }  // "ip:port"
+    const std::string& peer() const { return peer_; }
 
-    // ===== 业务回调注入 =====
-    void set_message_callback(MessageCallback cb) { message_cb_ = std::move(cb); }
-    void set_close_callback(CloseCallback cb)     { close_cb_ = std::move(cb); }
+    // 业务读缓冲（也可由业务直接操作）
+    Buffer& input_buffer() { return input_buffer_; }
+    const Buffer& output_buffer() const { return output_buffer_; }
 
-    // ===== I/O 接口（由 Server 的事件循环调用）=====
+    void set_message_callback(MessageCallback cb)        { message_cb_ = std::move(cb); }
+    void set_close_callback(CloseCallback cb)            { close_cb_ = std::move(cb); }
+    void set_update_events_callback(UpdateEventsCallback cb) { update_events_cb_ = std::move(cb); }
 
-    // EPOLLIN 触发时调用：循环 read 直到 EAGAIN，把数据通过 message_cb_ 抛给业务。
-    // 遇到对端关闭 / 错误时，会把状态置为 kDisconnected 并调用 close_cb_。
+    // EPOLLIN：循环 read 到 input_buffer_，再回调给业务
     void handle_read();
 
-    // 业务侧主动发送数据。
-    // 当前实现：直接写；写不完的部分会打印警告并丢弃（后续步骤会换成写缓冲区+EPOLLOUT）。
-    // 返回成功写出的字节数。
-    ssize_t send(std::string_view data);
+    // EPOLLOUT：把 output_buffer_ 中的数据继续 write 出去
+    void handle_write();
 
-    // 主动关闭连接：关闭 fd、状态变 Disconnected、触发 close_cb_。
-    // 可由业务层在 message_cb_ 里调用。
+    // 业务侧主动发数据
+    // 行为：
+    //   1) 若 output_buffer_ 是空且未关注 EPOLLOUT，先尝试直接 write
+    //   2) write 不完 / EAGAIN：把剩余追加到 output_buffer_，并开启 EPOLLOUT
+    //   3) 若 output_buffer_ 非空：直接追加到尾部，等 handle_write 处理
+    void send(std::string_view data);
+
+    // 主动关闭（也会被 read=0 / 出错时内部调用）
     void close();
 
 private:
+    void enable_write_events();    // 开启 EPOLLOUT 关注
+    void disable_write_events();   // 关闭 EPOLLOUT 关注
+
     int fd_;
-    std::string peer_;     // "ip:port"，仅用于日志
+    std::string peer_;
     State state_;
 
+    // 当前在 epoll 上关注的事件位（默认 EPOLLIN | EPOLLET）
+    uint32_t events_;
+
+    Buffer input_buffer_;
+    Buffer output_buffer_;
+
     MessageCallback message_cb_;
-    CloseCallback   close_cb_;
+    CloseCallback close_cb_;
+    UpdateEventsCallback update_events_cb_;
 };
 
 }  // namespace epoll_proj

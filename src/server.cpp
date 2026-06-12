@@ -37,6 +37,13 @@ bool epoll_add(int epfd, int fd, uint32_t events) {
     return ::epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0;
 }
 
+bool epoll_mod(int epfd, int fd, uint32_t events) {
+    epoll_event ev{};
+    ev.events = events;
+    ev.data.fd = fd;
+    return ::epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+}
+
 }  // namespace
 
 TcpServer::TcpServer(uint16_t port) : port_(port) {
@@ -45,14 +52,12 @@ TcpServer::TcpServer(uint16_t port) : port_(port) {
     epfd_ = ::epoll_create1(EPOLL_CLOEXEC);
     if (epfd_ < 0) die("epoll_create1");
 
-    // listen_fd: 监听可读 + 边沿触发，与循环 accept 直到 EAGAIN 配合
     if (!epoll_add(epfd_, listen_fd_, EPOLLIN | EPOLLET)) {
         die("epoll_ctl(listen_fd)");
     }
 }
 
 TcpServer::~TcpServer() {
-    // unique_ptr 会自动析构所有 Connection（其析构里 close fd）
     connections_.clear();
     if (listen_fd_ >= 0) ::close(listen_fd_);
     if (epfd_ >= 0) ::close(epfd_);
@@ -81,7 +86,6 @@ void TcpServer::create_listen_socket() {
 }
 
 void TcpServer::handle_accept() {
-    // ET 模式：必须循环 accept 直到 EAGAIN
     while (true) {
         sockaddr_in client_addr{};
         socklen_t client_len = sizeof(client_addr);
@@ -108,10 +112,17 @@ void TcpServer::handle_accept() {
             continue;
         }
 
-        // 创建 Connection 并注入回调
         auto conn = std::make_unique<Connection>(conn_fd, client_addr);
         if (message_cb_) conn->set_message_callback(message_cb_);
-        conn->set_close_callback([this](Connection& c) { remove_connection(c); });
+        // close 回调：Connection::close() 调用时 fd_ 仍然保留（不会被置为 -1），
+        // 所以这里直接用 c.fd() 即可，语义比之前"捕获 conn_fd"更直观。
+        conn->set_close_callback([this](Connection& c) {
+            remove_connection(c.fd());
+        });
+        // 事件更新回调：Connection 想开/关 EPOLLOUT 时通过它通知 Server
+        conn->set_update_events_callback([this](Connection& c, uint32_t events) {
+            update_events(c.fd(), events);
+        });
 
         std::cout << "[server] new client fd=" << conn_fd
                   << " from " << conn->peer()
@@ -121,23 +132,22 @@ void TcpServer::handle_accept() {
     }
 }
 
-void TcpServer::remove_connection(Connection& conn) {
-    int fd = conn.fd();  // 注意：close() 内部已经把 fd_ 置 -1，此处不能再用
-    // 由于 Connection::close 已经把 fd_ 置成 -1，先在 close 之前我们记不到真实 fd。
-    // 解决：在 close_callback 里通过 connections_ 反查也可以，但更简单的做法是
-    // 直接遍历找到这个 Connection 的迭代器。这里我们改用按对象地址查找：
-    for (auto it = connections_.begin(); it != connections_.end(); ++it) {
-        if (it->second.get() == &conn) {
-            int real_fd = it->first;
-            ::epoll_ctl(epfd_, EPOLL_CTL_DEL, real_fd, nullptr);
-            std::cout << "[server] client closed fd=" << real_fd
-                      << " (" << conn.peer() << "), remaining="
-                      << (connections_.size() - 1) << std::endl;
-            connections_.erase(it);
-            return;
-        }
+void TcpServer::remove_connection(int fd) {
+    auto it = connections_.find(fd);
+    if (it == connections_.end()) return;
+
+    ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
+    std::cout << "[server] client closed fd=" << fd
+              << " (" << it->second->peer() << "), remaining="
+              << (connections_.size() - 1) << std::endl;
+    connections_.erase(it);
+}
+
+void TcpServer::update_events(int fd, uint32_t events) {
+    if (!epoll_mod(epfd_, fd, events)) {
+        std::cerr << "[server] epoll_ctl MOD failed for fd=" << fd
+                  << ": " << std::strerror(errno) << std::endl;
     }
-    (void)fd;  // 避免未使用警告
 }
 
 void TcpServer::run() {
@@ -165,21 +175,27 @@ void TcpServer::run() {
                 continue;
             }
 
-            // 已连接客户端事件
             auto it = connections_.find(fd);
             if (it == connections_.end()) {
-                // 可能上一轮已经被移除（理论上不该到这里）
                 ::epoll_ctl(epfd_, EPOLL_CTL_DEL, fd, nullptr);
                 continue;
             }
             Connection& conn = *it->second;
 
+            // 错误优先：直接关闭
             if (ev & (EPOLLERR | EPOLLHUP)) {
-                conn.close();   // 会回调 remove_connection
+                conn.close();
                 continue;
             }
+            // 可读
             if (ev & EPOLLIN) {
                 conn.handle_read();
+                // 业务回调中可能已经 close()，再次确认
+                if (!connections_.count(fd)) continue;
+            }
+            // 可写
+            if (ev & EPOLLOUT) {
+                conn.handle_write();
             }
         }
     }
