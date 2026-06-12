@@ -22,6 +22,7 @@ add_compile_options(-Wall -Wextra)
 # 可执行目标
 add_executable(epoll_proj
     main.cpp
+    src/channel.cpp
     src/connection.cpp
     src/event_loop.cpp
     src/server.cpp
@@ -40,6 +41,7 @@ target_link_libraries(epoll_proj PRIVATE Threads::Threads)
 # ---- 测试：EventLoop 跨线程能力 ----
 add_executable(test_event_loop
     test_event_loop.cpp
+    src/channel.cpp
     src/event_loop.cpp
 )
 target_include_directories(test_event_loop PRIVATE

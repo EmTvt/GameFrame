@@ -3,7 +3,6 @@
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netinet/in.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -11,6 +10,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+
+#include "channel.h"
 
 namespace epoll_proj {
 
@@ -34,25 +35,32 @@ bool set_nonblocking(int fd) {
 TcpServer::TcpServer(uint16_t port) : port_(port) {
     create_listen_socket();
 
-    // 把 listen_fd 挂到 EventLoop 上：来事件就调 handle_accept
-    // 事件位掩码这里其实用不上（listen socket 只关心 EPOLLIN），但保留参数让回调签名统一
-    loop_.add_fd(listen_fd_, EPOLLIN | EPOLLET, [this](uint32_t ev) {
-        if (ev & (EPOLLERR | EPOLLHUP)) {
-            std::cerr << "[server] listen_fd error/hup, exiting." << std::endl;
-            std::exit(EXIT_FAILURE);
-        }
-        handle_accept();
+    // listen_fd 走 Channel 体系：accept 时只关心可读
+    // 错误/挂断在这里直接退出（教学项目简化处理）
+    accept_channel_ = std::make_unique<Channel>(&loop_, listen_fd_);
+    accept_channel_->set_read_cb([this]() { handle_accept(); });
+    accept_channel_->set_error_cb([]() {
+        std::cerr << "[server] listen_fd EPOLLERR, exiting." << std::endl;
+        std::exit(EXIT_FAILURE);
     });
+    accept_channel_->set_close_cb([]() {
+        std::cerr << "[server] listen_fd EPOLLHUP, exiting." << std::endl;
+        std::exit(EXIT_FAILURE);
+    });
+    accept_channel_->enable_reading();
 }
 
 TcpServer::~TcpServer() {
-    // 先清空 connections_，Connection 析构会 ::close(fd)；
-    // 此时 loop_ 还活着、loop_.del_fd 也能正常工作，但我们不在 Connection 析构里调它 ——
-    //   Connection 不感知 EventLoop 的存在（保持对外接口干净）。
-    // 由于 epfd 即将被 loop_ 析构关掉，残留的 fd 关注关系会随 epfd 一起释放，没有泄漏。
+    // 顺序：先清空 connections_（Connection 析构会摘 channel + close fd），
+    // 再摘 accept_channel_，最后由 loop_ 析构关 epfd / wakeup_fd。
     connections_.clear();
+
+    if (accept_channel_) {
+        accept_channel_->disable_all();
+        accept_channel_->remove();
+        accept_channel_.reset();
+    }
     if (listen_fd_ >= 0) ::close(listen_fd_);
-    // epfd_ 由 loop_ 自己负责，不需要这里关
 }
 
 void TcpServer::create_listen_socket() {
@@ -97,51 +105,22 @@ void TcpServer::handle_accept() {
             continue;
         }
 
-        auto conn = std::make_unique<Connection>(conn_fd, client_addr);
+        auto conn = std::make_unique<Connection>(&loop_, conn_fd, client_addr);
         if (message_cb_) conn->set_message_callback(message_cb_);
         // close 回调：Connection::close() 调用时 fd_ 仍然保留（不会被置为 -1），
         // 所以这里直接用 c.fd() 即可。
         conn->set_close_callback([this](Connection& c) {
             remove_connection(c.fd());
         });
-        // 事件更新回调：Connection 想开/关 EPOLLOUT 时通过它通知 Server
-        conn->set_update_events_callback([this](Connection& c, uint32_t events) {
-            update_events(c.fd(), events);
-        });
-
-        // 注册到事件循环
-        loop_.add_fd(conn_fd, EPOLLIN | EPOLLET, [this, conn_fd](uint32_t ev) {
-            handle_conn_event(conn_fd, ev);
-        });
 
         std::cout << "[server] new client fd=" << conn_fd
                   << " from " << conn->peer()
                   << ", total=" << (connections_.size() + 1) << std::endl;
 
+        // 先放进表，再 start() —— 否则万一 EPOLLIN 立刻触发、close_cb 回调时找不到 self
+        Connection* raw = conn.get();
         connections_.emplace(conn_fd, std::move(conn));
-    }
-}
-
-void TcpServer::handle_conn_event(int fd, uint32_t ev) {
-    auto it = connections_.find(fd);
-    if (it == connections_.end()) return;  // 防御：连接可能已被关闭
-    Connection& conn = *it->second;
-
-    // 错误优先：直接关闭
-    if (ev & (EPOLLERR | EPOLLHUP)) {
-        conn.close();
-        return;
-    }
-    // 可读
-    if (ev & EPOLLIN) {
-        conn.handle_read();
-        // resource-safety.md 第 4 节：业务回调可能已经 close()，再次确认
-        // 注意：本检查必须保留 —— 否则下面 handle_write 是 UAF
-        if (!connections_.count(fd)) return;
-    }
-    // 可写
-    if (ev & EPOLLOUT) {
-        conn.handle_write();
+        raw->start();  // 把 channel enable_reading，正式开始收事件
     }
 }
 
@@ -149,16 +128,12 @@ void TcpServer::remove_connection(int fd) {
     auto it = connections_.find(fd);
     if (it == connections_.end()) return;
 
-    // 先从 epoll 注销，再 erase（unique_ptr 析构会 close fd）
-    loop_.del_fd(fd);
+    // Channel 的 epoll 注销 + fd 的 ::close 都已经在 Connection::close() 里完成
+    // 这里只负责把表项移除（unique_ptr 析构走\"已 close\"分支，不会重复 close）
     std::cout << "[server] client closed fd=" << fd
               << " (" << it->second->peer() << "), remaining="
               << (connections_.size() - 1) << std::endl;
     connections_.erase(it);
-}
-
-void TcpServer::update_events(int fd, uint32_t events) {
-    loop_.mod_fd(fd, events);
 }
 
 void TcpServer::run() {

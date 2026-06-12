@@ -2,12 +2,14 @@
 
 #include <arpa/inet.h>
 #include <sys/epoll.h>
-#include <sys/uio.h>      // readv
 #include <unistd.h>
 
 #include <cerrno>
 #include <cstring>
 #include <iostream>
+
+#include "channel.h"
+#include "event_loop.h"
 
 namespace epoll_proj {
 
@@ -21,36 +23,57 @@ std::string format_peer(const sockaddr_in& addr) {
 
 }  // namespace
 
-Connection::Connection(int fd, const sockaddr_in& peer_addr)
-    : fd_(fd),
+Connection::Connection(EventLoop* loop, int fd, const sockaddr_in& peer_addr)
+    : loop_(loop),
+      fd_(fd),
       peer_(format_peer(peer_addr)),
       state_(State::kConnected),
-      events_(EPOLLIN | EPOLLET) {}
+      channel_(std::make_unique<Channel>(loop, fd)) {
+    // 把事件分类回调挂到 channel 上 —— 原先在 Server::handle_conn_event 里的事件分支
+    // 现在归位到 Connection 自己
+    channel_->set_read_cb ([this]() { handle_read(); });
+    channel_->set_write_cb([this]() { handle_write(); });
+    channel_->set_close_cb([this]() { close(); });
+    channel_->set_error_cb([this]() {
+        std::cerr << "[conn " << peer_ << "] EPOLLERR" << std::endl;
+        close();
+    });
+}
 
 Connection::~Connection() {
     // 兜底：仅当从未调用过 close() 时，才在析构里关闭 fd（防泄漏）。
-    // 已调用 close() 的情况下，state_ == kDisconnected，fd 已被关闭，这里跳过。
+    // 已调用 close() 的情况：state_ == kDisconnected，channel 已 remove、fd 已关闭，跳过。
     if (state_ == State::kConnected && fd_ >= 0) {
+        // 在 close fd 前先把 channel 从 epoll 摘掉，否则内核虽然会自动清理，
+        // 但 Channel 内部 state_ 还停在 kAdded，未来若 Channel 被复用会出错
+        if (channel_) {
+            channel_->disable_all();
+            channel_->remove();
+        }
         ::close(fd_);
         fd_ = -1;
     }
 }
 
+void Connection::start() {
+    // 把本连接挂上 epoll：关注读事件
+    // 拆分出 start() 是为了让"Connection 构造好 + Server 把它放进 connections_ 表" 之后，
+    // 再触发可能的事件 —— 避免 EPOLLIN 来得太快，close_cb 找不到自己。
+    loop_->assert_in_loop_thread();
+    channel_->enable_reading();
+}
+
 // ---------- 读 ----------
 void Connection::handle_read() {
-    // 使用 readv 配合栈上额外缓冲，提高一次性读取量、减少系统调用次数
-    // 普通做法：用 input_buffer_.begin_write() 直接读，简单清晰，这里采用这种
     while (true) {
-        // 至少留 4KB 写入空间
         input_buffer_.ensure_writable(4096);
         ssize_t n = ::read(fd_,
                            input_buffer_.begin_write(),
                            input_buffer_.writable_bytes());
         if (n > 0) {
             input_buffer_.has_written(static_cast<size_t>(n));
-            // 不在循环里频繁回调，等读完一轮再统一通知业务
         } else if (n == 0) {
-            // 对端关闭：如果 output_buffer 还有未发数据，简化处理为直接放弃
+            // 对端关闭
             close();
             return;
         } else {
@@ -63,7 +86,6 @@ void Connection::handle_read() {
         }
     }
 
-    // 通知业务：现在 input_buffer_ 里可能有完整或半完整的消息，让业务自取
     if (message_cb_ && input_buffer_.readable_bytes() > 0) {
         message_cb_(*this, input_buffer_);
     }
@@ -71,9 +93,9 @@ void Connection::handle_read() {
 
 // ---------- 写 ----------
 void Connection::handle_write() {
-    // 仅在 output_buffer_ 有数据时才会被关注 EPOLLOUT，所以这里通常 readable > 0
     if (output_buffer_.empty()) {
-        disable_write_events();
+        // 理论上不会走到这里：只有 buffer 有数据时才关注 EPOLLOUT
+        if (channel_->is_writing()) channel_->disable_writing();
         return;
     }
 
@@ -95,7 +117,7 @@ void Connection::handle_write() {
     }
 
     // 全部写完了，关掉 EPOLLOUT 避免空转
-    disable_write_events();
+    if (channel_->is_writing()) channel_->disable_writing();
 }
 
 void Connection::send(std::string_view data) {
@@ -104,7 +126,7 @@ void Connection::send(std::string_view data) {
     size_t remaining = data.size();
     const char* ptr = data.data();
 
-    // 1) 若没有积压数据，先尝试直接 write 一把（快路径，避免每次都过 buffer）
+    // 快路径：没有积压数据时，直接 write 一把
     if (output_buffer_.empty()) {
         while (remaining > 0) {
             ssize_t n = ::write(fd_, ptr, remaining);
@@ -114,8 +136,7 @@ void Connection::send(std::string_view data) {
             } else if (n < 0) {
                 if (errno == EINTR) continue;
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                    // 内核发送缓冲满了，剩余进 buffer
-                    break;
+                    break;  // 内核发送缓冲满了，剩余进 buffer
                 }
                 std::cerr << "[conn " << peer_ << "] send failed: "
                           << std::strerror(errno) << std::endl;
@@ -125,42 +146,35 @@ void Connection::send(std::string_view data) {
         }
     }
 
-    // 2) 还有剩余 → 追加到 output_buffer_，开启 EPOLLOUT 让事件循环帮忙发
+    // 还有剩余 → 追加到 output_buffer_，开启 EPOLLOUT
     if (remaining > 0) {
         output_buffer_.append(ptr, remaining);
-        enable_write_events();
+        if (!channel_->is_writing()) {
+            channel_->enable_writing();
+        }
     }
 }
 
 // ---------- 关闭 ----------
 void Connection::close() {
     if (state_ == State::kDisconnected) return;
-    state_ = State::kDisconnected;  // 仅用 state_ 表示 "已关闭"，不动 fd_
+    state_ = State::kDisconnected;
+
+    // 先把 channel 从 epoll 摘掉，再 close fd —— 避免 fd 关掉后 epoll 还可能投递事件
+    // （内核会自动清理，但显式 remove 让 Channel 状态机和 epoll 状态保持一致）
+    if (channel_) {
+        channel_->disable_all();
+        channel_->remove();
+    }
 
     if (fd_ >= 0) {
         ::close(fd_);
-        // 注意：这里【保留】fd_ 的值，不置 -1。
-        //   1) 让 close_cb_ 里的 Server 能通过 c.fd() 找到自己在 map 里的 key
-        //   2) 析构函数根据 state_ 判断要不要再 close，避免重复关闭
-        // 风险防护：state_ 已是 kDisconnected，本类不会再对该 fd 做任何 I/O
+        // 保留 fd_ 值：业务回调（close_cb_）需要通过 c.fd() 找到自己在 map 里的 key
     }
 
     if (close_cb_) {
         close_cb_(*this);
     }
-}
-
-// ---------- EPOLLOUT 控制 ----------
-void Connection::enable_write_events() {
-    if (events_ & EPOLLOUT) return;
-    events_ |= EPOLLOUT;
-    if (update_events_cb_) update_events_cb_(*this, events_);
-}
-
-void Connection::disable_write_events() {
-    if (!(events_ & EPOLLOUT)) return;
-    events_ &= ~EPOLLOUT;
-    if (update_events_cb_) update_events_cb_(*this, events_);
 }
 
 }  // namespace epoll_proj

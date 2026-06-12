@@ -1,11 +1,11 @@
 // TcpServer: 基于 EventLoop 的多客户端 TCP 服务器
 //
-// 拆分动作（第六步预备）：
-//   - epoll 的创建 / wait / ctl 全部下沉到 EventLoop
-//   - TcpServer 只负责：监听 socket、accept、Connection 生命周期管理
-//   - 通过向 EventLoop 注册"fd → 事件回调"挂上自己
+// 第七步演进（引入 Channel）：
+//   - 不再持有 update_events_cb_ 这条注入链：Connection 自己通过 channel 改事件
+//   - 不再有 handle_conn_event：事件分发回到 Connection 自己（由它的 Channel 调用 read/write/close/error_cb）
+//   - listen_fd 用一个 accept_channel_ 包起来，与 Connection 路径对称
 //
-// Connection 的接口完全不变，所以这次拆分对业务代码（main.cpp）零影响。
+// 业务对外接口（set_message_callback / run）保持不变。
 
 #pragma once
 
@@ -17,6 +17,8 @@
 #include "event_loop.h"
 
 namespace epoll_proj {
+
+class Channel;
 
 class TcpServer {
 public:
@@ -35,14 +37,16 @@ public:
 private:
     void create_listen_socket();
     void handle_accept();
-    void handle_conn_event(int fd, uint32_t events);  // 单个连接 fd 的事件分发
-    void remove_connection(int fd);                   // 由 Connection 关闭时回调
-    void update_events(int fd, uint32_t events);      // 由 Connection 调整关注事件
+    void remove_connection(int fd);   // 由 Connection 关闭时回调
 
     uint16_t port_;
     int listen_fd_ = -1;
 
     EventLoop loop_;
+
+    // listen_fd 的 epoll 代言人：把 accept 路径也纳入 Channel 体系
+    // 注意 unique_ptr —— Channel 持 EventLoop*，必须在 loop_ 构造完后才能 new
+    std::unique_ptr<Channel> accept_channel_;
 
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
 
