@@ -45,6 +45,7 @@ public:
     State state() const { return state_; }
     bool connected() const { return state_ == State::kConnected; }
     const std::string& peer() const { return peer_; }
+    EventLoop* loop() const { return loop_; }   // TcpServer 析构时按 conn 归属派任务用
 
     Buffer& input_buffer() { return input_buffer_; }
     const Buffer& output_buffer() const { return output_buffer_; }

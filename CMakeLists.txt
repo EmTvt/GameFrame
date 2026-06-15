@@ -25,6 +25,8 @@ add_executable(epoll_proj
     src/channel.cpp
     src/connection.cpp
     src/event_loop.cpp
+    src/event_loop_thread.cpp
+    src/event_loop_thread_pool.cpp
     src/server.cpp
 )
 

@@ -1,11 +1,15 @@
 // TcpServer: 基于 EventLoop 的多客户端 TCP 服务器
 //
-// 第七步演进（引入 Channel）：
-//   - 不再持有 update_events_cb_ 这条注入链：Connection 自己通过 channel 改事件
-//   - 不再有 handle_conn_event：事件分发回到 Connection 自己（由它的 Channel 调用 read/write/close/error_cb）
-//   - listen_fd 用一个 accept_channel_ 包起来，与 Connection 路径对称
+// 第八步演进（主从 Reactor）：
+//   - mainLoop：跑在主线程，只负责 listen / accept
+//   - subLoops：由 EventLoopThreadPool 管理，每个一个独立线程
+//     accept 出新连接后，round-robin 选一个 subLoop，把 Connection 的 I/O 全部交给它
+//   - num_threads = 0 时退化为单 Reactor，业务代码无需感知
 //
-// 业务对外接口（set_message_callback / run）保持不变。
+// 关键并发约定：
+//   - connections_ 这张表只在 mainLoop 线程访问（增/删）
+//   - Connection 自己的所有 I/O 操作在它归属的 subLoop 线程做
+//   - subLoop 触发 close 时，close_cb_ 跨线程派回 mainLoop 才能安全 erase
 
 #pragma once
 
@@ -19,12 +23,15 @@
 namespace epoll_proj {
 
 class Channel;
+class EventLoopThreadPool;
 
 class TcpServer {
 public:
     using MessageCallback = Connection::MessageCallback;
 
-    explicit TcpServer(uint16_t port);
+    // num_threads == 0 → 单 Reactor，所有 I/O 仍在主线程（兼容旧用法）
+    // num_threads >  0 → 起 N 个 IO 线程作为 subLoop
+    explicit TcpServer(uint16_t port, size_t num_threads = 0);
     ~TcpServer();
 
     TcpServer(const TcpServer&) = delete;
@@ -37,17 +44,18 @@ public:
 private:
     void create_listen_socket();
     void handle_accept();
-    void remove_connection(int fd);   // 由 Connection 关闭时回调
+    void remove_connection_in_loop(int fd, Connection* self);   // 永远在 mainLoop 线程执行
 
     uint16_t port_;
     int listen_fd_ = -1;
 
-    EventLoop loop_;
+    EventLoop loop_;   // mainLoop，跑在构造它的线程（= 主线程）
+    std::unique_ptr<EventLoopThreadPool> thread_pool_;
 
-    // listen_fd 的 epoll 代言人：把 accept 路径也纳入 Channel 体系
-    // 注意 unique_ptr —— Channel 持 EventLoop*，必须在 loop_ 构造完后才能 new
+    // listen_fd 的 epoll 代言人，挂在 mainLoop 上
     std::unique_ptr<Channel> accept_channel_;
 
+    // 仅由 mainLoop 线程访问 —— 不需要锁
     std::unordered_map<int, std::unique_ptr<Connection>> connections_;
 
     MessageCallback message_cb_;

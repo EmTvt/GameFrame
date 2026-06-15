@@ -10,6 +10,7 @@
 //   业务负责从 input 缓冲区里"按协议"取走完整消息；这里 echo 服务直接全部取走。
 
 #include <iostream>
+#include <thread>
 
 #include "src/buffer.h"
 #include "src/connection.h"
@@ -17,16 +18,19 @@
 
 int main() {
     constexpr uint16_t kPort = 8888;
+    constexpr size_t   kIoThreads = 4;   // 0 = 单 Reactor；>0 = 主从 Reactor
 
-    epoll_proj::TcpServer server(kPort);
+    epoll_proj::TcpServer server(kPort, kIoThreads);
 
     server.set_message_callback(
         [](epoll_proj::Connection& conn, epoll_proj::Buffer& input) {
             // 简单 echo：把当前缓冲区里所有数据取走并写回
             std::string data = input.retrieve_all_as_string();
 
-            std::cout << "[app] fd=" << conn.fd()
-                      << " (" << conn.peer() << ") recv " << data.size() << " bytes: ";
+            // 打印当前回调跑在哪个线程，直观验证 IO 已经分散到 subLoop 上
+            std::cout << "[app tid=" << std::this_thread::get_id() << "] fd="
+                      << conn.fd() << " (" << conn.peer() << ") recv "
+                      << data.size() << " bytes: ";
             std::cout.write(data.data(), static_cast<std::streamsize>(data.size()));
             std::cout.flush();
 
