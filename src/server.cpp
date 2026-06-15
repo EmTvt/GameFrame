@@ -56,15 +56,17 @@ TcpServer::~TcpServer() {
     // 析构顺序很关键：
     // 1) 先把所有 Connection 显式关掉 —— 此时各 subLoop 还活着，channel->remove() 能正常走
     //    （连接的 I/O 操作都在 subLoop 线程，所以这里要 run_in_loop 派过去）
+    //    捕获 ConnectionPtr by-value：保证 functor 真正执行时 Connection 还在
     for (auto& [fd, conn] : connections_) {
         EventLoop* sub_loop = conn->loop();
-        Connection* raw = conn.get();
-        sub_loop->run_in_loop([raw]() { raw->close(); });
+        ConnectionPtr c = conn;
+        sub_loop->run_in_loop([c]() { c->close(); });
     }
     // 2) 销毁 thread_pool_ —— EventLoopThread 析构会让各 subLoop quit + join
     //    Connection 持有的 Channel 也在 subLoop 退出前安全摘干净
     thread_pool_.reset();
     // 3) 现在所有 subLoop 已经退出，connections_ 可以安全析构
+    //    （此时 close_cb 派给 mainLoop 的 erase 任务已经无意义，反正 mainLoop 也不再 loop 了）
     connections_.clear();
 
     if (accept_channel_) {
@@ -121,20 +123,21 @@ void TcpServer::handle_accept() {
         // round-robin 选 subLoop（num_threads=0 时回退到 mainLoop，行为不变）
         EventLoop* sub_loop = thread_pool_->next_loop();
 
-        auto conn = std::make_unique<Connection>(sub_loop, conn_fd, client_addr);
+        auto conn = std::make_shared<Connection>(sub_loop, conn_fd, client_addr);
         if (message_cb_) conn->set_message_callback(message_cb_);
 
         // close_cb 关键点：Connection::close() 在 subLoop 线程里被触发，
         //   但 connections_ 这张表只允许 mainLoop 访问 —— 必须派回主线程
-        // 注意 fd 复用陷阱：旧连接 fd 关闭后，新连接可能立刻拿到同一个 fd。
-        //   所以这里同时捕获 Connection*，remove 时按地址校验是不是同一个对象，
-        //   防止把新连接误删。教学项目里这是替代 shared_ptr<Connection> 的简化手段。
+        //
+        // 捕获 ConnectionPtr by-value：
+        //   - 比裸指针 + 地址校验更彻底：functor 派进 mainLoop 队列、排队等待执行的这段
+        //     空窗期里，Connection 不会被任何路径析构（functor 自己就是 owner 之一）
+        //   - 也天然防 fd 复用：等真正执行 erase 时，按 ConnectionPtr 是否等于 map[fd]
+        //     做相等比较即可（不同对象，shared_ptr 不可能相等）
         EventLoop* main_loop = &loop_;
-        Connection* self = conn.get();
-        conn->set_close_callback([main_loop, this, self](Connection& c) {
-            int fd = c.fd();
-            main_loop->run_in_loop([this, fd, self]() {
-                remove_connection_in_loop(fd, self);
+        conn->set_close_callback([main_loop, this](const ConnectionPtr& c) {
+            main_loop->run_in_loop([this, c]() {
+                remove_connection_in_loop(c);
             });
         });
 
@@ -146,29 +149,32 @@ void TcpServer::handle_accept() {
         // fd 复用兜底：旧连接关闭路径（close_cb → run_in_loop → remove_in_loop）
         //   可能还在 mainLoop 的 pending_functors_ 里没执行；这时 fd 已经被内核回收，
         //   新 accept 又拿到同一个 fd → map 里 key 撞车。
-        // 此时旧 conn 一定已经 kDisconnected（subLoop 那边的 close() 已经把状态改了），
-        //   直接覆盖（unique_ptr 析构走"已 close"分支，不再操作 channel/fd）是安全的。
-        // 但 close_cb 已经按"旧 self 指针"匹配，所以旧的那次 remove_in_loop 进来时
-        //   会发现 self != map[fd].get()，自动跳过 erase，不会误删新连接。
-        Connection* raw = conn.get();
+        // 旧 conn 一定已经 kDisconnected。这里直接 operator[] 覆盖会丢掉 map 里的
+        //   shared_ptr 引用，但 close_cb 那个 functor 自己还持有一份 —— 真正析构推迟到
+        //   remove_in_loop 执行时（且 functor 释放它持有的最后一份），完全安全。
+        // 旧的 remove_in_loop 进来时会发现 map[fd] != 它捕获的那个 ConnectionPtr，
+        //   按相等比较跳过 erase，不会误删新连接。
+        ConnectionPtr conn_ref = conn;   // 拿一份引用给后续 sub_loop functor 用
         connections_[conn_fd] = std::move(conn);
 
-        sub_loop->run_in_loop([raw]() {
+        sub_loop->run_in_loop([conn_ref]() {
             // 在 subLoop 线程里调 enable_reading —— Channel::update 内部 assert_in_loop_thread
-            raw->start();
+            conn_ref->start();
         });
     }
 }
 
-void TcpServer::remove_connection_in_loop(int fd, Connection* self) {
+void TcpServer::remove_connection_in_loop(const ConnectionPtr& conn) {
     // 永远在 mainLoop 线程执行（由 close_cb 通过 run_in_loop 派过来）
     loop_.assert_in_loop_thread();
 
+    int fd = conn->fd();
     auto it = connections_.find(fd);
     if (it == connections_.end()) return;
 
     // 关键校验：fd 复用场景下，map[fd] 可能已经是新连接了，不能误删
-    if (it->second.get() != self) {
+    //   shared_ptr 相等比较 = 两份 shared_ptr 是否管理同一个对象（指针级）
+    if (it->second != conn) {
         std::cout << "[server] stale close_cb for fd=" << fd
                   << " (already replaced by a new connection), skip erase." << std::endl;
         return;
@@ -178,10 +184,10 @@ void TcpServer::remove_connection_in_loop(int fd, Connection* self) {
               << " (" << it->second->peer() << "), remaining="
               << (connections_.size() - 1) << std::endl;
 
-    // erase 触发 unique_ptr<Connection> 析构
-    // 注意：此时 Connection::close() 已经在 subLoop 线程里跑完了
-    //   - Channel 已 remove、fd 已 close、state_ == kDisconnected
-    //   - 析构函数走"已 close"分支，不会重复操作
+    // erase 把 map 里那份 shared_ptr 释放掉。
+    // 真正的 Connection 析构时机取决于：还有没有别的 shared_ptr 在外面持有
+    //   - 通常没有 → 这里析构（Channel 已 remove、fd 已 close，析构走"已 close"分支）
+    //   - 业务/异步任务持有 → 等他们都放手时析构。这正是 shared_ptr 引入的意义。
     connections_.erase(it);
 }
 

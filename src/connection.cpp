@@ -60,6 +60,8 @@ void Connection::start() {
     // 拆分出 start() 是为了让"Connection 构造好 + Server 把它放进 connections_ 表" 之后，
     // 再触发可能的事件 —— 避免 EPOLLIN 来得太快，close_cb 找不到自己。
     loop_->assert_in_loop_thread();
+
+    channel_->tie(shared_from_this());
     channel_->enable_reading();
 }
 
@@ -87,7 +89,10 @@ void Connection::handle_read() {
     }
 
     if (message_cb_ && input_buffer_.readable_bytes() > 0) {
-        message_cb_(*this, input_buffer_);
+        // 拷贝一份 callback 再调用：handler 内部可能调 set_message_callback 改自己
+        //   （协议切换、握手完成切到正式协议等），直接通过成员调用会析构正在运行的 lambda → UB
+        auto cb = message_cb_;
+        cb(shared_from_this(), input_buffer_);
     }
 }
 
@@ -160,6 +165,13 @@ void Connection::close() {
     if (state_ == State::kDisconnected) return;
     state_ = State::kDisconnected;
 
+    // 关键 trick：先抓一份 shared_from_this，把"自己"的生命周期钉住到本函数结束。
+    //   close_cb_ 一旦触发，TcpServer 会派任务把 connections_[fd] erase 掉，
+    //   而 map 持有的就是最后一份 shared_ptr —— 如果没有 guard，erase 后我们就在自己的
+    //   析构里继续跑下面的代码，自我 UAF。
+    //   有了 guard，连接在 close() 退出之前不会被析构（即使 map 里那份已经没了）。
+    auto guard = shared_from_this();
+
     // 先把 channel 从 epoll 摘掉，再 close fd —— 避免 fd 关掉后 epoll 还可能投递事件
     // （内核会自动清理，但显式 remove 让 Channel 状态机和 epoll 状态保持一致）
     if (channel_) {
@@ -169,11 +181,11 @@ void Connection::close() {
 
     if (fd_ >= 0) {
         ::close(fd_);
-        // 保留 fd_ 值：业务回调（close_cb_）需要通过 c.fd() 找到自己在 map 里的 key
+        // 保留 fd_ 值：业务回调（close_cb_）需要通过 c->fd() 找到自己在 map 里的 key
     }
 
     if (close_cb_) {
-        close_cb_(*this);
+        close_cb_(guard);
     }
 }
 

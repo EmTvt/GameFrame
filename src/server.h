@@ -44,7 +44,10 @@ public:
 private:
     void create_listen_socket();
     void handle_accept();
-    void remove_connection_in_loop(int fd, Connection* self);   // 永远在 mainLoop 线程执行
+    // 永远在 mainLoop 线程执行
+    //   接收 ConnectionPtr by-value：close_cb 里捕获了 ConnectionPtr，派进 mainLoop
+    //   pending_functors_ 时连接的生命周期就跟着 functor 走 —— 直到这里 erase 完才释放
+    void remove_connection_in_loop(const ConnectionPtr& conn);
 
     uint16_t port_;
     int listen_fd_ = -1;
@@ -56,7 +59,9 @@ private:
     std::unique_ptr<Channel> accept_channel_;
 
     // 仅由 mainLoop 线程访问 —— 不需要锁
-    std::unordered_map<int, std::unique_ptr<Connection>> connections_;
+    // shared_ptr：让业务和异步回调可以安全持有 Connection 跨事件，
+    //   map 不再是连接的唯一 owner
+    std::unordered_map<int, ConnectionPtr> connections_;
 
     MessageCallback message_cb_;
 };

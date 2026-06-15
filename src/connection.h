@@ -23,16 +23,29 @@ namespace epoll_proj {
 
 class EventLoop;
 class Channel;
+class Connection;
 
-class Connection {
+// 统一别名：所有跨函数边界传递 Connection 的地方都用这个，
+// 让"谁可能在异步路径里持有连接"在类型上一眼可见
+using ConnectionPtr = std::shared_ptr<Connection>;
+
+// 让 Connection 能调 shared_from_this()，把"自己"以 shared_ptr 形式
+// 传给业务回调和异步 functor —— 任何一个还活着的 shared_ptr 都能延后 Connection 析构。
+// 这是为了支撑：
+//   1) 业务回调在异步链里持有 Connection（协程、定时器、跨 loop 任务）
+//   2) close() 流程中防止"close_cb 中途 Connection 被析构 → 自我 UAF"
+class Connection : public std::enable_shared_from_this<Connection> {
 public:
     enum class State {
         kConnected,
         kDisconnected,
     };
 
-    using MessageCallback = std::function<void(Connection& conn, Buffer& input)>;
-    using CloseCallback   = std::function<void(Connection& conn)>;
+    // 回调签名升级：传 const ConnectionPtr& 而不是 Connection&
+    //   - 业务可以把它存到 session map / 协程 frame / 定时器里，安全延长生命周期
+    //   - const& 避免每次调用多一次 atomic 引用计数操作
+    using MessageCallback = std::function<void(const ConnectionPtr& conn, Buffer& input)>;
+    using CloseCallback   = std::function<void(const ConnectionPtr& conn)>;
 
     // 新增 loop 参数：Channel 需要它来调 update_channel / remove_channel
     Connection(EventLoop* loop, int fd, const sockaddr_in& peer_addr);

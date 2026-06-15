@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 
 namespace epoll_proj {
 
@@ -58,6 +59,26 @@ public:
     // 调用方语义：本 channel 即将销毁、或对应 fd 即将 close 时调用一次
     void remove();
 
+    // ---------- 生命周期绑定 ----------
+    // 把 Channel 的事件派发期生命周期"挂钩"到一个外部 shared_ptr 上。
+    //
+    // 解决的问题：
+    //   引入"事件循环之外的主动 close 路径"（定时器、跨线程业务调度等）后，
+    //   handle_event 派发链上某个 cb 可能触发 conn->close() → map.erase →
+    //   Connection 析构。问题是 handle_event 自己还在 Connection 的成员函数
+    //   栈上运行（read_cb_ 等是 lambda 捕获 this 调成员函数）—— 后续分支
+    //   （比如 close 后又轮到 write_cb_）就在已死对象上跑了。
+    //
+    // 解法：让 Channel 持 weak_ptr，事件派发前升级成 shared_ptr，整个派发
+    //   过程中对象至少存活到 handle_event 退出。即使中途有人 close + erase，
+    //   map 那份 shared_ptr 没了，但栈上 guard 还在，析构推迟到 handle_event
+    //   返回之后。
+    //
+    // 用 weak_ptr<void> 而不是 weak_ptr<Connection>：
+    //   Channel 不依赖 Connection 类型（Acceptor 也用 Channel，但不需要 tie，
+    //   保持 tied_=false 即可走老路径）。
+    void tie(const std::shared_ptr<void>& obj);
+
     // ---------- 给 EventLoop 用的 ----------
     int fd() const { return fd_; }
     uint32_t events() const { return events_; }
@@ -74,6 +95,9 @@ public:
 
 private:
     void update();   // 转发到 loop_->update_channel(this)
+    // tied_ == true 时由 handle_event 锁住 tie_ 后调用，
+    // tied_ == false 时直接调用，行为等价
+    void handle_event_with_guard(uint32_t revents);
 
     static constexpr uint32_t kReadEvent = EPOLLIN | EPOLLRDHUP;
 
@@ -81,6 +105,11 @@ private:
     int        fd_;
     uint32_t   events_{0};
     State      state_{kNew};
+
+    // 生命周期绑定：tied_ 是显式开关，避免每次都去 lock 一个空 weak_ptr
+    // （也方便区分"没绑过"和"绑过但对象已死"两种语义）
+    std::weak_ptr<void> tie_;
+    bool tied_{false};
 
     EventCallback read_cb_;
     EventCallback write_cb_;

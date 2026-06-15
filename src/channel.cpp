@@ -12,7 +12,29 @@ Channel::~Channel() {
     // 调用方应在 close fd 之前调 disable_all() + remove()，让状态显式。
 }
 
+void Channel::tie(const std::shared_ptr<void>& obj) {
+    tie_  = obj;
+    tied_ = true;
+}
+
 void Channel::handle_event(uint32_t revents) {
+    if (tied_) {
+        // 升级 weak_ptr → shared_ptr：拿到表示对象还活着，本次派发期间它不会被析构
+        //   （除了我们手里这份 guard，map / 其他 shared_ptr 持有者爱怎样怎样）
+        // 没拿到说明对象已经析构（理论上不该发生：Channel 一般跟着 Connection 一起活，
+        //   但极端时序下、或将来 Channel 寿命被解耦时，这一层就是兜底）
+        if (auto guard = tie_.lock()) {
+            handle_event_with_guard(revents);
+        }
+        // guard 在这里析构，正好是事件派发完毕之后 —— 如果中途有人 close + erase，
+        // 真正的对象析构发生在这一刻，栈安全
+        return;
+    }
+    // 没 tie 的 Channel（如 Acceptor、wakeup eventfd）走老路径，零开销
+    handle_event_with_guard(revents);
+}
+
+void Channel::handle_event_with_guard(uint32_t revents) {
     // 关闭事件优先：EPOLLHUP 且没有 EPOLLIN 通常意味着对端纯关闭
     // 注：EPOLLRDHUP 算"对端写端关闭"，按读路径处理（让 handle_read 自己 read 到 0）
     if ((revents & EPOLLHUP) && !(revents & EPOLLIN)) {
