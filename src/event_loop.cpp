@@ -11,6 +11,7 @@
 #include <iostream>
 
 #include "channel.h"
+#include "timer_queue.h"
 
 namespace epoll_proj {
 
@@ -39,9 +40,17 @@ EventLoop::EventLoop() {
     wakeup_channel_ = std::make_unique<Channel>(this, wakeup_fd_);
     wakeup_channel_->set_read_cb([this]() { handle_wakeup(); });
     wakeup_channel_->enable_reading();  // → 内部调 update_channel → epoll_ctl ADD
+
+    // TimerQueue 必须在 EventLoop 主体（epfd_ / wakeup_channel_）就绪后再构造，
+    // 因为它内部要 new Channel，并立刻 enable_reading 把 timerfd 挂上 epoll
+    timer_queue_ = std::make_unique<TimerQueue>(this);
 }
 
 EventLoop::~EventLoop() {
+    // 析构顺序：先 timer_queue_，再 wakeup_channel_，最后关 fd
+    //   TimerQueue 析构会 remove 它的 Channel —— 必须趁 epfd_ 还活着
+    timer_queue_.reset();
+
     // 先把 wakeup_channel_ 从 epoll 注销（在 epfd_ 还活着的时候）
     if (wakeup_channel_) {
         wakeup_channel_->disable_all();
@@ -160,6 +169,20 @@ void EventLoop::queue_in_loop(Functor f) {
     if (!in_loop_thread() || calling_pending_functors_) {
         wakeup();
     }
+}
+
+// ---------- 定时器：转发给 TimerQueue ----------
+
+EventLoop::TimerId EventLoop::run_at(Timestamp when, TimerCallback cb) {
+    return timer_queue_->run_at(when, std::move(cb));
+}
+
+EventLoop::TimerId EventLoop::run_after(int64_t delay_ms, TimerCallback cb) {
+    return timer_queue_->run_after(delay_ms, std::move(cb));
+}
+
+void EventLoop::cancel_timer(TimerId id) {
+    timer_queue_->cancel(id);
 }
 
 // ---------- 线程归属 ----------

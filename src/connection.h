@@ -66,6 +66,26 @@ public:
     void set_message_callback(MessageCallback cb) { message_cb_ = std::move(cb); }
     void set_close_callback(CloseCallback cb)     { close_cb_ = std::move(cb); }
 
+    // ---------- 业务上下文挂载 ----------
+    // 每条连接附挂任意业务对象（idle timer id、HTTP 解析器、会话状态等）。
+    //
+    // 为什么用 shared_ptr<void> 而不是 std::any：
+    //   - any 每次取值都要 any_cast + RTTI 检查；shared_ptr<void> 是纯指针
+    //   - 业务往往希望"持有同一份上下文"的多个引用都活着，shared_ptr 天然支持
+    //
+    // 约定：只有 loop 线程能 set/get（Connection 本来就这条线程的）—— 无需加锁。
+    template <typename T>
+    void set_context(std::shared_ptr<T> ctx) { context_ = std::move(ctx); }
+
+    // 取上下文。调用方负责保证 T 类型正确（错了是 UB，static_pointer_cast 不做检查）。
+    // 没设过 context 时返回 nullptr。
+    template <typename T>
+    std::shared_ptr<T> context() const {
+        return std::static_pointer_cast<T>(context_);
+    }
+
+    bool has_context() const { return static_cast<bool>(context_); }
+
     // 真正把 channel 注册到 epoll 上 —— 让构造和注册分离，
     // 调用方 (TcpServer::handle_accept) 在 connections_ 表填好后再 enable_reading()，
     // 这样万一 EPOLLIN 立刻触发也能在 close_cb 里 erase 到自己。
@@ -98,6 +118,9 @@ private:
 
     MessageCallback message_cb_;
     CloseCallback close_cb_;
+
+    // 业务上下文 —— 类型擦除，由业务通过 set_context<T>/context<T>() 使用
+    std::shared_ptr<void> context_;
 };
 
 }  // namespace epoll_proj

@@ -157,7 +157,13 @@ void TcpServer::handle_accept() {
         ConnectionPtr conn_ref = conn;   // 拿一份引用给后续 sub_loop functor 用
         connections_[conn_fd] = std::move(conn);
 
-        sub_loop->run_in_loop([conn_ref]() {
+        // 把"连接建立"的通知 + start() 一起派到 subLoop。
+        //   - 必须在 subLoop 线程：业务回调里可能调 run_after 等只允许 loop 线程做的事
+        //   - 必须在 start() **之前** 触发 connection_cb_：否则 EPOLLIN 可能先到，
+        //     message_cb_ 跑起来时 idle timer 还没装，逻辑顺序反了
+        ConnectionCallback conn_cb = connection_cb_;   // 拷贝一份给 functor 用
+        sub_loop->run_in_loop([conn_ref, conn_cb]() {
+            if (conn_cb) conn_cb(conn_ref);
             // 在 subLoop 线程里调 enable_reading —— Channel::update 内部 assert_in_loop_thread
             conn_ref->start();
         });
@@ -189,6 +195,16 @@ void TcpServer::remove_connection_in_loop(const ConnectionPtr& conn) {
     //   - 通常没有 → 这里析构（Channel 已 remove、fd 已 close，析构走"已 close"分支）
     //   - 业务/异步任务持有 → 等他们都放手时析构。这正是 shared_ptr 引入的意义。
     connections_.erase(it);
+
+    // 通知业务"连接断开"。和"建立"对称地派回 subLoop 执行：
+    //   - 业务里若要 cancel_timer / 清 context，从 conn->loop() 起手最直观
+    //   - 即便 functor 排队期间 conn 的最后一份 shared_ptr 落地，functor 自己持有一份
+    //     by-value，不会析构出问题
+    if (connection_cb_) {
+        EventLoop* sub_loop = conn->loop();
+        ConnectionCallback cb = connection_cb_;
+        sub_loop->run_in_loop([conn, cb]() { cb(conn); });
+    }
 }
 
 void TcpServer::run() {

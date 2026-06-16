@@ -28,6 +28,7 @@ add_executable(epoll_proj
     src/event_loop_thread.cpp
     src/event_loop_thread_pool.cpp
     src/server.cpp
+    src/timer_queue.cpp
 )
 
 # 头文件搜索路径（让 #include "src/xxx.h" 和 #include "xxx.h" 都能工作）
@@ -45,6 +46,7 @@ add_executable(test_event_loop
     test_event_loop.cpp
     src/channel.cpp
     src/event_loop.cpp
+    src/timer_queue.cpp
 )
 target_include_directories(test_event_loop PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

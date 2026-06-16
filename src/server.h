@@ -27,7 +27,12 @@ class EventLoopThreadPool;
 
 class TcpServer {
 public:
-    using MessageCallback = Connection::MessageCallback;
+    using MessageCallback    = Connection::MessageCallback;
+    // 连接建立 / 断开都用这一个回调，业务靠 conn->connected() 区分（muduo 风格）。
+    //   - 建立时：state==kConnected，可以挂 idle timer、初始化 context
+    //   - 断开时：state==kDisconnected，可以清理 timer、释放 context（虽然 context
+    //     会随 Connection 析构自动释放，但 timer 这种"外部资源"必须显式 cancel）
+    using ConnectionCallback = std::function<void(const ConnectionPtr&)>;
 
     // num_threads == 0 → 单 Reactor，所有 I/O 仍在主线程（兼容旧用法）
     // num_threads >  0 → 起 N 个 IO 线程作为 subLoop
@@ -38,6 +43,7 @@ public:
     TcpServer& operator=(const TcpServer&) = delete;
 
     void set_message_callback(MessageCallback cb) { message_cb_ = std::move(cb); }
+    void set_connection_callback(ConnectionCallback cb) { connection_cb_ = std::move(cb); }
 
     void run();
 
@@ -64,6 +70,7 @@ private:
     std::unordered_map<int, ConnectionPtr> connections_;
 
     MessageCallback message_cb_;
+    ConnectionCallback connection_cb_;
 };
 
 }  // namespace epoll_proj

@@ -18,6 +18,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -28,11 +29,17 @@
 namespace epoll_proj {
 
 class Channel;
+class TimerQueue;
 
 class EventLoop {
 public:
     // 跨线程投递的任务：无参，业务自己用 lambda 捕获上下文
     using Functor = std::function<void()>;
+
+    // 定时回调
+    using TimerCallback = std::function<void()>;
+    using Timestamp     = std::chrono::steady_clock::time_point;
+    using TimerId       = uint64_t;
 
     EventLoop();
     ~EventLoop();
@@ -71,6 +78,12 @@ public:
     // 强制入队（即使调用者是 loop 线程也不直接执行）
     void queue_in_loop(Functor f);
 
+    // ---------- 定时器 ----------
+    // 任意线程调用都安全。返回 TimerId 供 cancel_timer 使用
+    TimerId run_at(Timestamp when, TimerCallback cb);
+    TimerId run_after(int64_t delay_ms, TimerCallback cb);
+    void    cancel_timer(TimerId id);
+
     // ---------- 线程归属 ----------
 
     bool in_loop_thread() const { return owner_tid_ == std::this_thread::get_id(); }
@@ -87,6 +100,10 @@ private:
     // wakeup_fd_ 对应的 Channel —— 让自己也走 Channel 体系，结构更对称
     // 用 unique_ptr 是因为 Channel 持有 EventLoop*，必须在 EventLoop 完全构造好后才能 new
     std::unique_ptr<Channel> wakeup_channel_;
+
+    // 定时器队列：跟 wakeup_channel_ 平级，构造完 EventLoop 主体后再 new
+    // 用 unique_ptr 是因为 TimerQueue 内部要持有 Channel，且其析构需要在 epfd_ 还活着时
+    std::unique_ptr<TimerQueue> timer_queue_;
 
     std::atomic<bool> quit_{false};
 
