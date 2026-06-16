@@ -53,3 +53,24 @@ target_include_directories(test_event_loop PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(test_event_loop PRIVATE Threads::Threads)
+
+# ---- log_server：独立的日志收集进程 ----
+# 故意复用 src/ 的网络库源文件而不是抽成 static lib：
+#   - 现阶段就一个 epoll_proj + 一个 log_server，抽 lib 是过度设计
+#   - 等第 3 步加入 TcpClient 时如果发现源文件列表越来越长，再统一抽 epoll_net 静态库
+add_executable(log_server
+    log_server/main.cpp
+    log_server/log_file.cpp
+    src/channel.cpp
+    src/connection.cpp
+    src/event_loop.cpp
+    src/event_loop_thread.cpp
+    src/event_loop_thread_pool.cpp
+    src/server.cpp
+    src/timer_queue.cpp
+)
+target_include_directories(log_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(log_server PRIVATE Threads::Threads)

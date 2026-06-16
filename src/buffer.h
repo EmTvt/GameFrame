@@ -75,6 +75,14 @@ public:
         return s;
     }
 
+    // 把前 len 字节作为 string 取出（消费掉）
+    // 调用方需保证 len <= readable_bytes()
+    std::string retrieve_as_string(size_t len) {
+        std::string s(peek(), len);
+        retrieve(len);
+        return s;
+    }
+
     // 清空（仅重置游标，不释放内存）
     void retrieve_all() {
         reader_index_ = kPrependSize;
