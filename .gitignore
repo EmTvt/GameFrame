@@ -2,6 +2,7 @@
 .cache/
 .vscode/
 build/
+res/
 
 # ===== 常见编译产物（可选，建议保留） =====
 *.o
@@ -11,6 +12,7 @@ build/
 *.dylib
 *.exe
 *.out
+*.log
 
 # ===== CMake 生成物（可选） =====
 CMakeFiles/

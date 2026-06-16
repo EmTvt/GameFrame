@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <iostream>
 
@@ -76,6 +77,10 @@ void Connection::handle_read() {
             input_buffer_.has_written(static_cast<size_t>(n));
         } else if (n == 0) {
             // 对端关闭
+            if (message_cb_ && input_buffer_.readable_bytes() > 0) {
+                auto cb = message_cb_;
+                cb(shared_from_this(), input_buffer_);
+            }
             close();
             return;
         } else {

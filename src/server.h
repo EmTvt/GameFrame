@@ -47,6 +47,10 @@ public:
 
     void run();
 
+    // 暴露 mainLoop 给业务侧使用：挂定时器、处理信号转 quit 等。
+    // 注意：只能用于 mainLoop（accept 路径），subLoop 由 thread_pool_ 私有管理。
+    EventLoop* main_loop() { return &loop_; }
+
 private:
     void create_listen_socket();
     void handle_accept();
