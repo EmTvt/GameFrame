@@ -123,6 +123,16 @@ void Connection::handle_write() {
 
     // 全部写完了，关掉 EPOLLOUT 避免空转
     if (channel_->is_writing()) channel_->disable_writing();
+
+    // 通知"buffer 已排空"。注意进到这里就一定意味着 readable_bytes() == 0：
+    //   - 入口若 buffer 为空已经 return 了
+    //   - while 循环只有把 buffer 写干净才会自然退出（出错/EAGAIN 都在内部 return 掉了）
+    // 因此 write_complete 是这条函数自然终点的事件，无需再次判断空
+    // —— 同样走 queue_in_loop，让业务回调里能安全地再 send / close
+    if (write_complete_cb_) {
+        loop_->queue_in_loop(
+            [self = shared_from_this(), cb = write_complete_cb_]() { cb(self); });
+    }
 }
 
 void Connection::send(std::string_view data) {
@@ -153,7 +163,22 @@ void Connection::send(std::string_view data) {
 
     // 还有剩余 → 追加到 output_buffer_，开启 EPOLLOUT
     if (remaining > 0) {
+        // 在 append 前后取一次 readable_bytes，做"跨高水位"边沿检测：
+        //   old_len < mark && new_len >= mark  → 这一次 send 把 buffer 推过了红线
+        // 只在跨越的瞬间触发一次回调；后续 send 哪怕 buffer 持续高位也不会重复打扰业务
+        // —— 业务自己要做的事就是"过载时该停就停"，水位降回 0 时由 write_complete 通知恢复
+        const size_t old_len = output_buffer_.readable_bytes();
         output_buffer_.append(ptr, remaining);
+        const size_t new_len = output_buffer_.readable_bytes();
+
+        if (high_water_mark_ > 0 && high_water_cb_ &&
+            old_len < high_water_mark_ && new_len >= high_water_mark_) {
+            // 异步派发到 loop：避免业务回调里再调 send/close 造成状态机递归
+            // 用 shared_from_this 钉住生命周期，回调真正执行时 Connection 一定还在
+            loop_->queue_in_loop(
+                [self = shared_from_this(), cb = high_water_cb_]() { cb(self); });
+        }
+
         if (!channel_->is_writing()) {
             channel_->enable_writing();
         }

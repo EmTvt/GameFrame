@@ -47,6 +47,21 @@ public:
     using MessageCallback = std::function<void(const ConnectionPtr& conn, Buffer& input)>;
     using CloseCallback   = std::function<void(const ConnectionPtr& conn)>;
 
+    // ---- 背压（back-pressure）相关回调 ----
+    //
+    // HighWaterMark：output_buffer_ 大小"从低于阈值跨过阈值"的瞬间触发一次
+    //   - 边沿触发，不是水平触发：避免业务在过载窗口内被回调淹没
+    //   - 业务收到后可选择：暂停发送 / 切到丢弃模式 / 关闭连接
+    //
+    // WriteComplete：output_buffer_ 排空（从非空 → 空）的瞬间触发一次
+    //   - 与 HighWaterMark 配对，业务靠这个信号知道"可以恢复发送了"
+    //
+    // 两个回调都在 conn 归属的 loop 线程里、通过 queue_in_loop 异步触发，
+    // 不会在 send() / handle_write() 内部同步执行 —— 防止业务回调再次 send/close
+    // 导致状态机递归。
+    using HighWaterMarkCallback = std::function<void(const ConnectionPtr& conn)>;
+    using WriteCompleteCallback = std::function<void(const ConnectionPtr& conn)>;
+
     // 新增 loop 参数：Channel 需要它来调 update_channel / remove_channel
     Connection(EventLoop* loop, int fd, const sockaddr_in& peer_addr);
     ~Connection();
@@ -65,6 +80,19 @@ public:
 
     void set_message_callback(MessageCallback cb) { message_cb_ = std::move(cb); }
     void set_close_callback(CloseCallback cb)     { close_cb_ = std::move(cb); }
+
+    // 设置高水位阈值 + 回调。mark == 0 表示禁用（默认）。
+    // 必须在 conn 投入使用之前设置 —— 不打算支持运行期热改，
+    // 否则需要把 mark / cb 写到 loop 线程才安全
+    void set_high_water_mark_callback(size_t mark, HighWaterMarkCallback cb) {
+        high_water_mark_ = mark;
+        high_water_cb_ = std::move(cb);
+    }
+
+    // output_buffer_ 排空时的通知。同样要求在投入使用前设置。
+    void set_write_complete_callback(WriteCompleteCallback cb) {
+        write_complete_cb_ = std::move(cb);
+    }
 
     // ---------- 业务上下文挂载 ----------
     // 每条连接附挂任意业务对象（idle timer id、HTTP 解析器、会话状态等）。
@@ -118,6 +146,12 @@ private:
 
     MessageCallback message_cb_;
     CloseCallback close_cb_;
+
+    // ---- 背压回调与阈值 ----
+    // high_water_mark_ == 0 表示禁用：所有跨阈值判断短路掉，零开销
+    HighWaterMarkCallback high_water_cb_;
+    WriteCompleteCallback write_complete_cb_;
+    size_t high_water_mark_ = 0;
 
     // 业务上下文 —— 类型擦除，由业务通过 set_context<T>/context<T>() 使用
     std::shared_ptr<void> context_;
