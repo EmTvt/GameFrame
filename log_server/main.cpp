@@ -9,8 +9,9 @@
 // 故意不做的事（避免过度设计）：
 //   - 不做协议版本号 / type 字段：先跑通最朴素的，等接入 AsyncLogger 时再加
 //   - 不做 ACK：日志是 fire-and-forget，客户端只关心 TCP 层送达
-//   - 不抽 LengthPrefixedCodec：第 2 步统一做（client/server 共享）
 //   - 不做多线程：单 EventLoop 处理网络 + 落盘，足够
+//
+// 解码：复用 src/length_prefixed_codec.h（client/server 共享，避免拆帧逻辑两份）
 //
 // 解耦点：
 //   - 与 epoll_proj 业务代码 0 耦合：只依赖 src/ 里的网络库组件
@@ -25,34 +26,26 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "log_server/log_file.h"
 #include "src/buffer.h"
 #include "src/connection.h"
 #include "src/event_loop.h"
+#include "src/length_prefixed_codec.h"
 #include "src/server.h"
 
 using epoll_proj::Buffer;
 using epoll_proj::ConnectionPtr;
 using epoll_proj::EventLoop;
+using epoll_proj::LengthPrefixedCodec;
 using epoll_proj::TcpServer;
 using log_server::LogFile;
 
 namespace {
 
-// 4 字节大端读法。Buffer 没有 peek_int32_be，所以这里手动从 readable 区前 4 字节取。
-// 调用方应保证 buf.readable_bytes() >= 4。
-uint32_t peek_uint32_be(const Buffer& buf) {
-    const char* p = buf.peek();
-    uint32_t n = 0;
-    n |= static_cast<uint8_t>(p[0]) << 24;
-    n |= static_cast<uint8_t>(p[1]) << 16;
-    n |= static_cast<uint8_t>(p[2]) << 8;
-    n |= static_cast<uint8_t>(p[3]);
-    return n;
-}
-
-// 单条最大允许长度，防止恶意/异常 length 把内存吃爆
+// 单条最大允许长度，防止恶意/异常 length 把内存吃爆。
+// 比 codec 默认的 16 MiB 更严：日志单条不该这么大。
 constexpr uint32_t kMaxFrameSize = 1 * 1024 * 1024;   // 1 MiB
 
 // 周期 flush 间隔。1s 是吞吐和"最坏丢多少"的折中：
@@ -122,27 +115,19 @@ int main(int argc, char* argv[]) {
     });
 
     server.set_message_callback([log_file](const ConnectionPtr& conn, Buffer& input) {
-        // 循环拆帧：可能一次 EPOLLIN 带来好多条日志，必须吃干净
-        while (true) {
-            if (input.readable_bytes() < 4) return;   // 头还没收齐
-
-            const uint32_t len = peek_uint32_be(input);
-            if (len == 0 || len > kMaxFrameSize) {
-                std::fprintf(stderr,
-                             "[log_server] bad frame length=%u from %s, closing\n",
-                             len, conn->peer().c_str());
-                conn->close();
-                return;
-            }
-
-            if (input.readable_bytes() < 4 + len) return;   // body 还不够
-
-            // 头收齐 + body 收齐 → 取一条
-            input.retrieve(4);
-            std::string payload = input.retrieve_as_string(len);
-
-            // 写盘。append_line 会自动加 "[时间] " 前缀和末尾换行，
-            // 这里把 payload 原样交给它即可（payload 本身不应含换行）。
+        // 拆帧用共享 codec：协议改了只改 codec 一处。
+        // decode 返回 false 表示遇到非法 length（0 或超限），buffer 已对不上边界，必须断连。
+        std::vector<std::string> msgs;
+        if (!LengthPrefixedCodec::decode(input, msgs, kMaxFrameSize)) {
+            std::fprintf(stderr,
+                         "[log_server] bad frame from %s, closing\n",
+                         conn->peer().c_str());
+            conn->close();
+            return;
+        }
+        // 正常路径：把这一轮解出的所有完整帧写盘。
+        // append_line 会自动加 "[时间] " 前缀和末尾换行，payload 本身不应含换行。
+        for (auto& payload : msgs) {
             log_file->append_line(payload);
         }
     });
