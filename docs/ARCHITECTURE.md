@@ -26,10 +26,14 @@
 └─────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────┐
-│  数据层： Buffer                                             │
-│  prependable / readable / writable 三段式                    │
+│  util 层（util/，纯头文件，不依赖 net）                      │
+│  - Buffer              ：prependable/readable/writable 三段式│
+│  - LengthPrefixedCodec ：4B 大端 length + payload 帧编解码   │
+│  - MPSCQueue<T>        ：多生产者单消费者有界队列（mutex+ring）│
 └─────────────────────────────────────────────────────────────┘
 ```
+
+**依赖方向**：业务 → 会话 → 事件 → util。util 自身不引用 net 任何头，可被业务直接复用（如 LOG_INFO → MPSCQueue → LogSender 链路）。
 
 ## 2. 主要调用流（accept 路径）
 

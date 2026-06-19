@@ -11,7 +11,7 @@
 //   - 不做 ACK：日志是 fire-and-forget，客户端只关心 TCP 层送达
 //   - 不做多线程：单 EventLoop 处理网络 + 落盘，足够
 //
-// 解码：复用 src/length_prefixed_codec.h（client/server 共享，避免拆帧逻辑两份）
+// 解码：复用 util/length_prefixed_codec.h（client/server 共享，避免拆帧逻辑两份）
 //
 // 解耦点：
 //   - 与 epoll_proj 业务代码 0 耦合：只依赖 src/ 里的网络库组件
@@ -29,10 +29,10 @@
 #include <vector>
 
 #include "log_server/log_file.h"
-#include "src/buffer.h"
+#include "util/buffer.h"
 #include "src/connection.h"
 #include "src/event_loop.h"
-#include "src/length_prefixed_codec.h"
+#include "util/length_prefixed_codec.h"
 #include "src/server.h"
 
 using epoll_proj::Buffer;

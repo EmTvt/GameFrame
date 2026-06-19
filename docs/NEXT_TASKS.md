@@ -32,9 +32,9 @@
 
 ## 短期（log_server 闭环 / 按实现顺序）
 
-### Task 1. `LengthPrefixedCodec` — 编解码共享组件
+### Task 1. `LengthPrefixedCodec` — 编解码共享组件 ✅ Done (2026-06-18)
 
-**文件**：`src/length_prefixed_codec.h`（纯头文件，无状态）
+**文件**：`util/length_prefixed_codec.h`（纯头文件，无状态）
 
 **职责**：把 `log_server/main.cpp` lambda 里的拆帧逻辑抽成 client/server 共享组件。
 
@@ -59,15 +59,29 @@ struct LengthPrefixedCodec {
 - `log_server/main.cpp` 切到用 `LengthPrefixedCodec::decode`
 - 加单元测试或 smoke 验证
 
-### Task 2. `MPSCQueue<T>` — 无锁有界队列
+### Task 2. `MPSCQueue<T>` — 多生产者单消费者有界队列 ✅ Done (2026-06-18)
 
-**文件**：`src/mpsc_queue.h`
+**文件**：`util/mpsc_queue.h`（拆分到 util/ 见 DECISIONS.md 2026-06-18 "util/ 目录拆分"条）
 
 **核心特性**：
-- **有界**：容量上限（如 10000 条 / 10 MB），满时丢弃**最旧**日志（防 OOM）
+- **有界**：容量上限（如 10000 条 / 10 MB），满时**丢最新**（push 直接返回 false，不动队列）—— 与 muduo / spdlog 一致，理由见 `DECISIONS.md` 2026-06-18 条
+- **dropped 计数**：push 失败时累加 `atomic<uint64_t> dropped_`；LogSender drain 时若 `dropped_ > 0`，在该批日志前合成一条 `[LOG_DROPPED] N messages lost` 并清零，避免静默丢失
 - **多生产者**：任意业务线程并发 push（先 mutex 跑通，再考虑 lock-free 优化）
 - **单消费者**：只有 LogSender 线程 drain
 - **批量 drain**：`drain(vector<T>& out, size_t max_batch)` 一次取一批
+
+**接口草案**：
+```cpp
+template <class T>
+class MPSCQueue {
+public:
+    explicit MPSCQueue(size_t capacity);
+    bool   push(T v);                              // 满则返回 false，dropped_ + 1
+    size_t drain(std::vector<T>& out, size_t max_batch);
+    uint64_t take_dropped();                       // 原子读出并清零（LogSender 用）
+    size_t size() const;
+};
+```
 
 **唤醒策略**：
 - push 后设 `atomic<bool> has_pending_ = true`
@@ -85,7 +99,8 @@ struct LengthPrefixedCodec {
 - 持有 `TcpClient`（连 LogServer）
 - 持有 `MPSCQueue<string>`（接业务日志）
 - 定时 drain → `LengthPrefixedCodec::encode` → `tcp_client.send`
-- LogServer 断线期间：日志继续入队（不阻塞业务），队列满则丢最旧
+- LogServer 断线期间：日志继续入队（不阻塞业务），队列满则**丢最新**（与 muduo/spdlog 一致；
+  drain 前调 `take_dropped()`，>0 时合成 `[LOG_DROPPED] N messages lost` 插到批次开头）
 
 **生命周期**：
 - 全局单例（或 main 中创建后传给 LOG 宏）

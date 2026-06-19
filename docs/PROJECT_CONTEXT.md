@@ -8,13 +8,14 @@
 
 不是工业级框架，是教学/学习驱动：每加一个组件都对应一个能讲清楚动机的"步"，**演进顺序优先于一次到位**。
 
-## 2. 顶层产物（四个可执行）
+## 2. 顶层产物（五个可执行）
 
 | target | 入口文件 | 用途 |
 |---|---|---|
 | `epoll_proj`        | `main.cpp`              | echo demo + idle timeout（10s 不发数据踢人）。验证 TcpServer + TimerQueue + Connection::set_context 整条链路。 |
 | `test_event_loop`   | `test_event_loop.cpp`   | 最小测试：跨线程 `run_in_loop` 投递任务能落到 loop 线程执行。 |
 | `test_tcp_client`   | `test_tcp_client.cpp`   | TcpClient 验证：连接 echo server → 主动 close → 自动重连 → 再次 echo。 |
+| `test_mpsc_queue`   | `test_mpsc_queue.cpp`   | MPSCQueue 单/多线程语义：FIFO / 丢最新 / dropped 计数 / 边沿唤醒。 |
 | `log_server`        | `log_server/main.cpp`   | 独立进程，监听 TCP，按 `len|payload` 协议收日志，按"日 + 大小"滚动落盘。 |
 
 ## 3. 目录结构与模块职责
@@ -28,8 +29,12 @@ epoll_proj/
 ├── main.cpp                   # epoll_proj demo 入口（echo + idle）
 ├── test_event_loop.cpp        # EventLoop 跨线程能力测试
 ├── test_tcp_client.cpp        # TcpClient 连接/重连测试
-├── src/                       # 网络库本体
+├── test_mpsc_queue.cpp        # MPSCQueue 单/多线程语义测试
+├── util/                      # 与网络层无强耦合的通用件（纯头文件）
 │   ├── buffer.h               # readable / writable / prependable 三段式 Buffer
+│   ├── length_prefixed_codec.h# 4B 大端 length + payload 帧编解码（仅依赖 Buffer）
+│   └── mpsc_queue.h           # 多生产者单消费者有界队列（mutex+ring，丢最新）
+├── src/                       # 网络库本体（依赖 util/）
 │   ├── channel.{h,cpp}        # fd 在 epoll 视角的"代言人"，含 tie() 生命周期保护
 │   ├── connection.{h,cpp}     # 单条 TCP 连接：input/output buffer + 4 类回调 + 背压 + context<T>
 │   ├── event_loop.{h,cpp}     # epoll_wait + Channel 派发 + wakeup_fd + pending_functors + TimerQueue
@@ -44,6 +49,8 @@ epoll_proj/
     ├── smoke_client.py        # 简易客户端：发一条/多条 length-prefixed 消息
     └── roll_stress.py         # 压测脚本：往里灌 >10MiB 验证滚动
 ```
+
+**依赖方向**：`log_server / main.cpp / test_*  →  src/  →  util/`。`util/` 自身不 `#include "src/*"`，是单向依赖底层。
 
 ## 4. 构建/运行
 

@@ -14,7 +14,7 @@
 #include <memory>
 #include <thread>
 
-#include "src/buffer.h"
+#include "util/buffer.h"
 #include "src/connection.h"
 #include "src/event_loop.h"
 #include "src/server.h"

@@ -54,6 +54,17 @@ target_include_directories(test_event_loop PRIVATE
 )
 target_link_libraries(test_event_loop PRIVATE Threads::Threads)
 
+# ---- 测试：MPSCQueue 多生产者单消费者队列 ----
+# 纯头文件实现，只链 pthread；故意不依赖 src/ 任何 .cpp，保证测试隔离。
+add_executable(test_mpsc_queue
+    test_mpsc_queue.cpp
+)
+target_include_directories(test_mpsc_queue PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_mpsc_queue PRIVATE Threads::Threads)
+
 # ---- log_server：独立的日志收集进程 ----
 # 故意复用 src/ 的网络库源文件而不是抽成 static lib：
 #   - 现阶段就一个 epoll_proj + 一个 log_server，抽 lib 是过度设计
@@ -74,3 +85,7 @@ target_include_directories(log_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(log_server PRIVATE Threads::Threads)
+
+add_executable(test_mpsc_queue_tsan test_mpsc_queue.cpp)
+target_compile_options(test_mpsc_queue_tsan PRIVATE -fsanitize=thread -O1 -g)
+target_link_options   (test_mpsc_queue_tsan PRIVATE -fsanitize=thread)
