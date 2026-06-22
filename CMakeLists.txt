@@ -19,16 +19,24 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # 编译选项
 add_compile_options(-Wall -Wextra)
 
-# 可执行目标
-add_executable(epoll_proj
-    main.cpp
+# 网络库源文件集合：避免在每个可执行目标里重复列举。
+# 仍故意不抽 static lib —— 目标数量还少，object 重编也快；等到第二个可执行 demo
+# 想用部分文件再考虑 OBJECT library。
+set(EPOLL_NET_SOURCES
     src/channel.cpp
     src/connection.cpp
     src/event_loop.cpp
     src/event_loop_thread.cpp
     src/event_loop_thread_pool.cpp
     src/server.cpp
+    src/tcp_client.cpp
     src/timer_queue.cpp
+)
+
+# 可执行目标
+add_executable(epoll_proj
+    main.cpp
+    ${EPOLL_NET_SOURCES}
 )
 
 # 头文件搜索路径（让 #include "src/xxx.h" 和 #include "xxx.h" 都能工作）
@@ -66,25 +74,30 @@ target_include_directories(test_mpsc_queue PRIVATE
 target_link_libraries(test_mpsc_queue PRIVATE Threads::Threads)
 
 # ---- log_server：独立的日志收集进程 ----
-# 故意复用 src/ 的网络库源文件而不是抽成 static lib：
-#   - 现阶段就一个 epoll_proj + 一个 log_server，抽 lib 是过度设计
-#   - 等第 3 步加入 TcpClient 时如果发现源文件列表越来越长，再统一抽 epoll_net 静态库
+# 复用 EPOLL_NET_SOURCES（见上）。
 add_executable(log_server
     log_server/main.cpp
     log_server/log_file.cpp
-    src/channel.cpp
-    src/connection.cpp
-    src/event_loop.cpp
-    src/event_loop_thread.cpp
-    src/event_loop_thread_pool.cpp
-    src/server.cpp
-    src/timer_queue.cpp
+    ${EPOLL_NET_SOURCES}
 )
 target_include_directories(log_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(log_server PRIVATE Threads::Threads)
+
+# ---- 测试：TcpClient 非阻塞 connect + 指数退避重连 ----
+# 跑前先启动 log_server（默认端口 9099）。本程序连过去发若干 length-prefix 帧，
+# 再演示一次断线重连。详细使用方式见 test_tcp_client.cpp 头注释。
+add_executable(test_tcp_client
+    test_tcp_client.cpp
+    ${EPOLL_NET_SOURCES}
+)
+target_include_directories(test_tcp_client PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_tcp_client PRIVATE Threads::Threads)
 
 add_executable(test_mpsc_queue_tsan test_mpsc_queue.cpp)
 target_compile_options(test_mpsc_queue_tsan PRIVATE -fsanitize=thread -O1 -g)
