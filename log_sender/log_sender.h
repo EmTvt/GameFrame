@@ -120,6 +120,32 @@ public:
     // 仅供测试 / 监控用。
     size_t queue_size() const { return queue_.size(); }
 
+    // ---------------- 全局访问点（给 LOG_* 宏用） ----------------
+    //
+    // 为什么是"全局指针注册"而不是"自构造单例"：
+    //   - 日志是横切关注点，LOG_INFO 要能在任意文件/线程零参数调用，所以需要
+    //     一个全局可达的入口 —— 这是 set_global/global 存在的理由。
+    //   - 但 LogSender 的构造依赖 EventLoop*/host/port，且 sender_loop_ 必须是
+    //     已经跑起来的专属线程；自构造单例拿不到这些，还会和"loop 由上层持有"的既有风格冲突。
+    //   - 更关键的是析构顺序：stop() 必须在 sender_loop_ 线程、loop 还活着时跑完
+    //     （见 stop_in_loop 的 tcp_client_.reset()）。若交给静态析构，时机不可控，
+    //     会重蹈 ~TcpClient 跨线程 assert 的覆辙。
+    //
+    // 因此：实例仍由调用方（一般是 main）构造 + 拥有，这里只存一个**不接管所有权**
+    // 的裸指针。约定用法：
+    //   LogSender sender(loop, host, port);
+    //   sender.start();
+    //   LogSender::set_global(&sender);   // 业务线程起来之前注册
+    //   ... 业务到处 LOG_INFO ...
+    //   LogSender::set_global(nullptr);   // 业务线程 join 之后、stop 之前注销，杜绝悬空
+    //   sender.stop();
+    //
+    // 线程约定：set_global 只在"业务线程尚未启动"或"已全部 join"时调用，与并发的
+    //   global() 读取不重叠，因此用普通指针即可，不需要 atomic。宏侧 global() 拿到
+    //   nullptr 时静默跳过（日志系统未就绪 / 已注销），不会崩。
+    static void set_global(LogSender* s) { g_instance_ = s; }
+    static LogSender* global() { return g_instance_; }
+
 private:
     // 全在 sender_loop_ 线程跑
     void start_in_loop();
@@ -172,6 +198,10 @@ private:
     // 启动 / 停止状态。push 不看这俩，只看 queue 本身；start/stop 自己幂等。
     bool started_ = false;
     bool stopped_ = false;
+
+    // 全局访问点的后端存储。inline static：头文件里就地定义，无需在某个 .cpp 里
+    // 再补一行外部定义。裸指针，不接管所有权（见 set_global 注释）。
+    static inline LogSender* g_instance_ = nullptr;
 };
 
 }  // namespace epoll_proj

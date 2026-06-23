@@ -8,14 +8,16 @@
 
 不是工业级框架，是教学/学习驱动：每加一个组件都对应一个能讲清楚动机的"步"，**演进顺序优先于一次到位**。
 
-## 2. 顶层产物（五个可执行）
+## 2. 顶层产物（可执行）
 
 | target | 入口文件 | 用途 |
 |---|---|---|
-| `epoll_proj`        | `main.cpp`              | echo demo + idle timeout（10s 不发数据踢人）。验证 TcpServer + TimerQueue + Connection::set_context 整条链路。 |
+| `epoll_proj`        | `main.cpp`              | echo demo + idle timeout（10s 不发数据踢人）+ **业务侧 LOG_* 接入**（连接/收包/踢人落盘到 log_server）。验证 TcpServer + TimerQueue + Connection::set_context + LogSender 整条链路。 |
 | `test_event_loop`   | `test_event_loop.cpp`   | 最小测试：跨线程 `run_in_loop` 投递任务能落到 loop 线程执行。 |
 | `test_tcp_client`   | `test_tcp_client.cpp`   | TcpClient 验证：连接 echo server → 主动 close → 自动重连 → 再次 echo。 |
 | `test_mpsc_queue`   | `test_mpsc_queue.cpp`   | MPSCQueue 单/多线程语义：FIFO / 丢最新 / dropped 计数 / 边沿唤醒。 |
+| `test_log_sender`   | `test_log_sender.cpp`   | LogSender 多生产者并发 push + 真发到外部 log_server（需先起 log_server）。 |
+| `test_logging`      | `test_logging.cpp`      | LOG_* 宏端到端：进程内自建 mini sink，无需外部进程，计数精确比对 + nullptr 安全。 |
 | `log_server`        | `log_server/main.cpp`   | 独立进程，监听 TCP，按 `len|payload` 协议收日志，按"日 + 大小"滚动落盘。 |
 
 ## 3. 目录结构与模块职责
@@ -26,10 +28,12 @@ epoll_proj/
 ├── CLAUDE.md                  # 新会话入口（短）
 ├── docs/                      # 项目文档（本目录）
 ├── .claude/                   # 规则与 skill
-├── main.cpp                   # epoll_proj demo 入口（echo + idle）
+├── main.cpp                   # epoll_proj demo 入口（echo + idle + LOG_* 接入）
 ├── test_event_loop.cpp        # EventLoop 跨线程能力测试
 ├── test_tcp_client.cpp        # TcpClient 连接/重连测试
 ├── test_mpsc_queue.cpp        # MPSCQueue 单/多线程语义测试
+├── test_log_sender.cpp        # LogSender 并发 push + 真发到外部 log_server
+├── test_logging.cpp           # LOG_* 宏端到端（进程内 mini sink，自包含）
 ├── util/                      # 与网络层无强耦合的通用件（纯头文件）
 │   ├── buffer.h               # readable / writable / prependable 三段式 Buffer
 │   ├── length_prefixed_codec.h# 4B 大端 length + payload 帧编解码（仅依赖 Buffer）
@@ -43,6 +47,9 @@ epoll_proj/
 │   ├── server.{h,cpp}         # TcpServer：listen + accept + 把 conn 分给 subLoop
 │   ├── tcp_client.{h,cpp}     # 主动连接 + 指数退避重连
 │   └── timer_queue.{h,cpp}    # 基于 timerfd 的 set<Entry>，O(logN) 增删
+├── log_sender/                # 业务侧日志发送（net 之上的应用层，依赖 src/ + util/）
+│   ├── log_sender.{h,cpp}     # MPSCQueue + TcpClient 组装：drain→encode→send；含 set_global/global
+│   └── logging.h              # LOG_DEBUG/INFO/WARN/ERROR 宏 + format_log + 编译期级别开关
 └── log_server/                # 业务层验证：日志收集服务
     ├── main.cpp               # 协议拆帧 + 信号处理 + 周期 flush
     ├── log_file.{h,cpp}       # 按日 + 序号滚动的文件落盘
@@ -50,7 +57,7 @@ epoll_proj/
     └── roll_stress.py         # 压测脚本：往里灌 >10MiB 验证滚动
 ```
 
-**依赖方向**：`log_server / main.cpp / test_*  →  src/  →  util/`。`util/` 自身不 `#include "src/*"`，是单向依赖底层。
+**依赖方向**：`log_sender / log_server / main.cpp / test_*  →  src/  →  util/`。`util/` 自身不 `#include "src/*"`，是单向依赖底层；`log_sender/` 在 net 之上（`log_sender → src → util`）。
 
 ## 4. 构建/运行
 
@@ -76,6 +83,9 @@ ls -la res/log/      # 期望 .log.1..5
 
 # TcpClient 连接 + 重连自测
 ./build/test_tcp_client
+
+# LOG_* 宏端到端自测（自包含，无需外部 log_server；返回码即结论）
+./build/test_logging
 ```
 
 ## 5. 工具链约束

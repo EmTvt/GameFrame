@@ -104,11 +104,36 @@ public:
 
 **测试**：`test_log_sender`（4 producer × 10000 条，cap=5000 队列），落盘行数 = ok push + 1 条 LOG_DROPPED 合成，对账精确。
 
-### Task 4. `LOG_INFO` 宏 — 业务侧接口（下一步）
+### Task 4. `LOG_*` 宏 — 业务侧接口 ✅ Done (2026-06-23)
 
 **文件**：`log_sender/logging.h`
 
-**设计**：
+**最终实现**（与下方早期草案有出入，以此为准）：
+```cpp
+#define LOG_INFO(fmt, ...) \
+    EPOLL_LOG_IMPL(::epoll_proj::LogLevel::INFO, 1, fmt __VA_OPT__(,) __VA_ARGS__)
+// EPOLL_LOG_IMPL: do{ if(level<LOG_COMPILE_LEVEL) break;
+//                     auto* s=LogSender::global(); if(!s) break;
+//                     s->push(format_log(level, __FILE__, __LINE__, fmt, ...)); }while(0)
+```
+
+**落地要点**（给后续会话定位）：
+- 四级别 `LOG_DEBUG/INFO/WARN/ERROR`，都经 `EPOLL_LOG_IMPL` 统一展开
+- `format_log` 在**调用线程**用两遍 `vsnprintf` 格式化，带 `__attribute__((format(printf,4,5)))` 编译期校验；输出 `LEVEL file:line | body`，**不打时间戳**（log_server 的 append_line 统一加，避免两段时间）
+- **全局访问点**用 `LogSender::set_global(LogSender*)/global()`，**不是自构造单例**：实例仍由调用方（main）构造拥有，静态成员只存裸指针。决策与理由见 `DECISIONS.md` 2026-06-23 条（草案里 `LogSender::instance()` 的写法已废弃）
+- 编译期级别门控 `if ((level_num) < LOG_COMPILE_LEVEL) break;`：两端常量，关掉的级别整段为死代码被消除（零开销）。release 用 `-DLOG_COMPILE_LEVEL=2` 只留 WARN/ERROR
+- 用 C++20 `__VA_OPT__(,)` 而非 GNU `##__VA_ARGS__`，符合工程 `-std=c++20`（`CMAKE_CXX_EXTENSIONS OFF`）
+- nullptr 安全：`global()` 为空（未注册 / 已注销）时静默跳过，不崩
+
+**业务接入**：`main.cpp`（echo demo）已接 LogSender —— 连接/断开 → LOG_INFO、收包 → LOG_DEBUG、空闲踢人 → LOG_WARN；新增 SIGINT/SIGTERM 优雅退出（quit → `set_global(nullptr)` → `sender.stop()`）。`CMakeLists.txt` 的 `epoll_proj` 目标补了 `${LOG_SENDER_SOURCES}`。
+
+**测试**：`test_logging`（自包含，进程内 mini sink，无需外部 log_server）。四级别各 400 条端到端计数精确匹配（other=0），并覆盖 set_global 前 / set_global(nullptr) 后的 no-op；`./build/test_logging` 返回码即结论。
+
+---
+
+### Task 4 早期草案（保留存档；以上方"最终实现"为准）
+
+最初草案用的是自构造单例 `LogSender::instance().push(...)`：
 ```cpp
 #define LOG_INFO(fmt, ...) \
     do { \

@@ -45,6 +45,7 @@ set(LOG_SENDER_SOURCES
 add_executable(epoll_proj
     main.cpp
     ${EPOLL_NET_SOURCES}
+    ${LOG_SENDER_SOURCES}
 )
 
 # 头文件搜索路径（让 #include "src/xxx.h" 和 #include "xxx.h" 都能工作）
@@ -123,3 +124,16 @@ target_include_directories(test_log_sender PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(test_log_sender PRIVATE Threads::Threads)
+
+# ---- 测试：LOG_* 宏端到端（自包含，进程内 mini sink，无需外部 log_server）----
+# 直接 ./build/test_logging 一键跑，返回码即结论。详见 test_logging.cpp 头注释。
+add_executable(test_logging
+    test_logging.cpp
+    ${EPOLL_NET_SOURCES}
+    ${LOG_SENDER_SOURCES}
+)
+target_include_directories(test_logging PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_logging PRIVATE Threads::Threads)
