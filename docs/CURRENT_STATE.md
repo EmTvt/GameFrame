@@ -49,7 +49,12 @@ Last updated: 2026-06-23
 ## In Progress
 
 无进行中的任务。日志链路（业务进程 LOG_* → MPSCQueue → LogSender → TcpClient → log_server → 落盘）已端到端打通并有 test_logging 回归。
-下一步从「中期（网络库补完）」里挑：优先 `shutdown(SHUT_WR)` 半关（能顺带解决 LogSender stop 时 outbuf 未排空会丢的已知问题）。
+
+下一阶段路线已在 `docs/NEXT_TASKS.md` 排好（按依赖顺序逐个实现）：
+- **Task 5（推荐先做）**：`Connection` 半关 `shutdown(SHUT_WR)` —— 顺带修掉「LogSender stop 时 outbuf 未排空会丢」的已知 bug。
+- **Task 6**：`Connection::force_close_with_delay(ms)`。
+- **Task 7**：`HttpServer` demo（HTTP/1.1 解析，验证 set_context 状态机 + 半关收尾）。
+- **Task 8**：协程层（C++20，与回调层并存；子步 8.1 task.h → 8.2 co_await sleep_for → 8.3 I/O awaiter → 8.4 协程 echo）。
 
 ## Known Problems / 待验证
 
@@ -93,3 +98,7 @@ Last updated: 2026-06-23
 | 15.2 | LengthPrefixedCodec 也迁入 util/（见 DECISIONS 2026-06-18 晚条） | ✅ |
 | 16 | LogSender（独立线程 + TcpClient 发日志） | ✅ |
 | 17 | LOG_* 宏（业务侧接口）+ main.cpp 接入 + test_logging | ✅ (2026-06-23) |
+| 18 | Connection 半关 shutdown(SHUT_WR)（NEXT_TASKS Task 5） | ⬜ 下一个 |
+| 19 | Connection::force_close_with_delay（Task 6） | ⬜ |
+| 20 | HttpServer demo / HTTP-1.1 解析（Task 7） | ⬜ |
+| 21 | 协程层 C++20（Task 8，与回调层并存，分 8.1~8.5 子步） | ⬜ |
