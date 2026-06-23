@@ -89,24 +89,22 @@ public:
 - 只在 `false → true` 翻转时额外 wakeup（边沿通知，避免高频 wakeup）
 - 高吞吐 → 自动批量；低吞吐 → 延迟最多 50ms（日志场景可接受）
 
-### Task 3. `LogSender` — 日志发送器
+### Task 3. `LogSender` — 日志发送器 ✅ Done (2026-06-22)
 
-**文件**：`log_sender/log_sender.{h,cpp}`（新目录）
+**文件**：`log_sender/log_sender.{h,cpp}`
 
-**职责**：组装 MPSCQueue + TcpClient + 独立 EventLoop。
+**实现要点**（写下来给后续会话定位，别再"猜"细节）：
+- 构造签名 `LogSender(EventLoop* sender_loop, host, port, Options)`：sender_loop 由调用方持有（一般是 `EventLoopThread::start_loop()` 的返回值），与 TcpClient 风格一致。提供两个构造重载，避开"类内默认实参里引用嵌套类型默认成员初始化"的 C++ 解析限制。
+- 三个内部状态：`connection_`（kConnected 时非空，重连间隙为 nullptr）、`paused_`（HighWater→true，WriteComplete→false）、`tick_timer_id_`（0 当哨兵；TimerQueue 从 1 开始派号，安全）
+- tick 自递归：`on_tick` 跑完 drain 后再 `schedule_next_tick()`，避免一次 `run_every`-类语义带来的状态泄漏（cancel 一致性更好查）
+- push 边沿唤醒：`MPSCQueue::push` 返回 `wake_up=true` 那次走 `queue_in_loop` 戳醒 sender_loop_，让首条消息能以微秒级延迟落地（不必等下一个 50ms tick）。`on_tick` 自己幂等：无 connection / paused 时直接跳过
+- LOG_DROPPED 合成：`do_drain_and_send` 开头调 `take_dropped()`，>0 时在批次最前插一条 `[LOG_DROPPED] N messages lost`
+- 析构顺序坑：`~TcpClient` 第一行 `assert_in_loop_thread`。**必须在 stop_in_loop 里 `tcp_client_.reset()`**（在 sender_loop_ 线程销毁），让 LogSender 在 main 线程析构时 unique_ptr 已是 nullptr
+- stop 同步等：用 mutex+cv 而不是 future/promise，省一个标准库头依赖
 
-- 持有 `EventLoopThread`（自己跑一个 loop 线程）
-- 持有 `TcpClient`（连 LogServer）
-- 持有 `MPSCQueue<string>`（接业务日志）
-- 定时 drain → `LengthPrefixedCodec::encode` → `tcp_client.send`
-- LogServer 断线期间：日志继续入队（不阻塞业务），队列满则**丢最新**（与 muduo/spdlog 一致；
-  drain 前调 `take_dropped()`，>0 时合成 `[LOG_DROPPED] N messages lost` 插到批次开头）
+**测试**：`test_log_sender`（4 producer × 10000 条，cap=5000 队列），落盘行数 = ok push + 1 条 LOG_DROPPED 合成，对账精确。
 
-**生命周期**：
-- 全局单例（或 main 中创建后传给 LOG 宏）
-- 进程退出：stop() → drain 剩余 → 等发送完成（带超时） → 断开连接
-
-### Task 4. `LOG_INFO` 宏 — 业务侧接口
+### Task 4. `LOG_INFO` 宏 — 业务侧接口（下一步）
 
 **文件**：`log_sender/logging.h`
 

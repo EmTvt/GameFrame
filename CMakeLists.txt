@@ -33,6 +33,14 @@ set(EPOLL_NET_SOURCES
     src/timer_queue.cpp
 )
 
+# log_sender/ 源文件：业务进程的日志发送器（用 TcpClient + MPSCQueue 拼出来）。
+# 故意不并入 EPOLL_NET_SOURCES：log_sender 是 net 之上的应用层组件，依赖方向是
+# log_sender → net → util。给它独立的变量，让"谁能不带这个 .cpp 编"一眼可见
+# （例如 test_event_loop / test_mpsc_queue 就不需要它，避免不必要的编译耦合）。
+set(LOG_SENDER_SOURCES
+    log_sender/log_sender.cpp
+)
+
 # 可执行目标
 add_executable(epoll_proj
     main.cpp
@@ -102,3 +110,16 @@ target_link_libraries(test_tcp_client PRIVATE Threads::Threads)
 add_executable(test_mpsc_queue_tsan test_mpsc_queue.cpp)
 target_compile_options(test_mpsc_queue_tsan PRIVATE -fsanitize=thread -O1 -g)
 target_link_options   (test_mpsc_queue_tsan PRIVATE -fsanitize=thread)
+
+# ---- 测试：LogSender 多生产者并发 push + 真发到 log_server ----
+# 跑前先启动 log_server（默认端口 9099）。详细用法见 test_log_sender.cpp 头注释。
+add_executable(test_log_sender
+    test_log_sender.cpp
+    ${EPOLL_NET_SOURCES}
+    ${LOG_SENDER_SOURCES}
+)
+target_include_directories(test_log_sender PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(test_log_sender PRIVATE Threads::Threads)
