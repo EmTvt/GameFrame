@@ -56,6 +56,8 @@ Last updated: 2026-06-23
 - **Task 7**：`HttpServer` demo（HTTP/1.1 解析，验证 set_context 状态机 + 半关收尾）。
 - **Task 8**：协程层（C++20，与回调层并存；子步 8.1 task.h → 8.2 co_await sleep_for → 8.3 I/O awaiter → 8.4 协程 echo）。
 
+另有一条「方向探索」线（建在 Task 7/8 之上）：把 epoll_proj 改造成轻量游戏后台框架 —— Task 9 proto 编解码 + msgid 路由、Task 10 `run_every` 固定帧 tick、Task 11 会话/玩家管理。详见 `NEXT_TASKS.md`（含对比生产框架 gamesvr 的关键结论）。
+
 ## Known Problems / 待验证
 
 - **`Connection::close()` 不等 outbuf 排空**：LogSender stop 时如果 output_buffer_ 里还压着数据，会随 close 一起丢。当前 best-effort（stop 前 sleep 2s 摊薄），后续做 `shutdown(SHUT_WR)` 半关后才能严格保证 stop 不丢。
@@ -102,3 +104,6 @@ Last updated: 2026-06-23
 | 19 | Connection::force_close_with_delay（Task 6） | ⬜ |
 | 20 | HttpServer demo / HTTP-1.1 解析（Task 7） | ⬜ |
 | 21 | 协程层 C++20（Task 8，与回调层并存，分 8.1~8.5 子步） | ⬜ |
+| 22 | 游戏后台方向：proto 编解码 + msgid 路由（Task 9） | ⬜ |
+| 23 | 游戏后台方向：run_every 固定帧 game tick（Task 10） | ⬜ |
+| 24 | 游戏后台方向：会话/玩家管理 fd↔player（Task 11） | ⬜ |

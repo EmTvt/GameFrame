@@ -226,6 +226,66 @@ public:
 
 ---
 
+## 方向探索：把 epoll_proj 改造成轻量游戏后台框架
+
+> 来源：对比真实生产框架 `/data/workspace/myworkspace/server` 的 `redgamesvr/framework/gamesvr.cpp` 后的结论。
+> 这是一条「应用框架化」的演进线，建在 Task 7（HTTP，验证 set_context 状态机）+ Task 8（协程）之上。
+> **不要求一次做完**，按 Task 编号逐步来。
+
+### 先记住从生产框架学到的几条（避免重复踩认知偏差）
+
+- **那个 while 主循环在框架（tapp）里，业务只提供回调**：`pfnProc`（每轮处理）/ `pfnTick`（定时心跳）/ `pfnReload` / `pfnStop`。两条线分开：proc 拉消息、tick 跑定时器。
+- **proc 是 poll 驱动（忙转闲睡）**：`return msgprocess > 0 ? 0 : -1`，有消息就尽快再转、没消息才退避。它 poll 是因为消息源是 tbus 共享内存总线，**不是能塞进 epoll 的 fd**。
+  - **我们的不同点**：epoll_proj 直接 epoll 客户端 socket，是**事件驱动**，天然不需要空转 poll。所以**不要照搬「定时 60 次空转」**——固定帧（若需要）用 `run_every` 单独挂一条 game tick，与 I/O 就绪循环分开。
+- **生产框架不直接 epoll 客户端**：客户端 TCP 连在独立网关进程 `tconnd`，消息经 `tbus2` 总线进 gamesvr（`SGSConndMgr->Process()` 拉取），协议是 TDR `CSPKG`。即「连接管理（海量 fd）」与「游戏逻辑」拆成两进程。epoll_proj 当游戏后台 = 把这两者合一，**更简化但可行**（适合中小游戏）。
+- **协程是逻辑服刚需**：生产框架用 libco，因为「读 DB(tcaplus) → 拿结果 → 继续逻辑」不能阻塞唯一主循环。对应我们的 Task 8（C++20 协程）。所以「只加 proto」低估了工作量——异步逻辑可写依赖协程层。
+
+### Task 9. 业务协议层：protobuf 编解码 + msgid 路由 ⬜（先做，门槛最低）
+
+**文件**：`proto/`（新目录）：`.proto` 定义 + 生成代码；`net_app/message_codec.{h,cpp}`（在 `LengthPrefixedCodec` 外套一层）、`net_app/dispatcher.{h,cpp}`
+
+**职责**：
+- 帧格式升级：现有 `4B length + payload` 的 payload 内再分 `msgid(uint32) + protobuf body`。复用 `LengthPrefixedCodec` 做外层拆帧，内层解析 msgid + `ParseFromArray`。
+- 分发器：`register_handler(msgid, fn)`，收到完整消息后按 msgid 派发到业务 handler（对应生产框架的 `SGSBusMsgDispatcher`）。
+- 发送侧对称：`encode(msgid, const Message&)` → conn->send。
+
+**要点**：
+- 引 protobuf 依赖（CMake `find_package(Protobuf)` + `protobuf_generate`）。这是本任务唯一的新外部依赖，先确认环境可得。
+- handler 签名建议 `void(const ConnectionPtr&, const Message&)`，与现有回调风格一致。
+
+**验收**：定义一个 `Echo { string text }` proto，client 发 `EchoReq` → server handler 回 `EchoRsp`；跑通一个 msgid 的完整收发。
+
+### Task 10. 固定帧 game tick：`EventLoop::run_every(interval, cb)` ⬜
+
+**文件**：`src/event_loop.{h,cpp}`、`src/timer_queue.{h,cpp}`
+
+**职责**：现在只有一次性 `run_after`。游戏逻辑帧（如 60Hz 推进世界状态）需要周期定时器。
+
+**要点**：
+- `run_every` 可以基于 timerfd 的周期模式，或在回调里自递归 `run_after`（LogSender 的 flush 已用过自递归模式，可复用思路）。注意 cancel 语义要干净。
+- game tick 与 I/O 就绪循环（epoll_wait）是两条线：tick 推进逻辑、epoll 处理网络，**不要合并成空转 poll**。
+
+**验收**：挂一个 16.6ms 的 tick，统计实际触发频率接近 60Hz；cancel 后不再触发。
+
+### Task 11. 会话 / 玩家管理：`fd ↔ player` 映射 + 登录态 ⬜
+
+**文件**：`net_app/session_mgr.{h,cpp}`
+
+**职责**：对应生产框架的 `GSConnPlayerMap`。维护连接与玩家身份的映射、登录态、断线处理。
+
+**要点**：
+- 用 `Connection::set_context<Session>()` 给每条连接挂会话对象（player_id、登录状态、最近活跃时间等）。
+- 断线（close_cb）时清理映射；可选断线重连窗口。
+- 与 Task 9 分发器配合：未登录连接只允许 login 类 msgid，登录后才放行业务 msgid。
+
+**验收**：client 走「login → 业务请求 → 断开」流程，server 端能正确建立/查询/清理会话。
+
+### 走完之后
+
+Task 9+10+11（+ Task 8 协程）合起来，epoll_proj 就具备一个**轻量游戏后台骨架**：事件驱动 I/O + 固定帧 tick + proto 路由 + 会话管理 + 协程异步逻辑。再往后才是「分网关/逻辑进程、接 DB、热重载、监控」这些生产级特性——那已超出本教学项目范围，按需再说。
+
+---
+
 ## 其它（按痛点，未排期）
 
 - [ ] **集成测试**：补一个"TcpServer 多线程压测 + Connection 析构顺序"的脚本/可执行（当前并发析构路径无专门覆盖）。
