@@ -2,6 +2,7 @@
 
 #include <arpa/inet.h>
 #include <sys/epoll.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -44,9 +45,7 @@ Connection::Connection(EventLoop* loop, int fd, const sockaddr_in& peer_addr)
 Connection::~Connection() {
     // 兜底：仅当从未调用过 close() 时，才在析构里关闭 fd（防泄漏）。
     // 已调用 close() 的情况：state_ == kDisconnected，channel 已 remove、fd 已关闭，跳过。
-    if (state_ == State::kConnected && fd_ >= 0) {
-        // 在 close fd 前先把 channel 从 epoll 摘掉，否则内核虽然会自动清理，
-        // 但 Channel 内部 state_ 还停在 kAdded，未来若 Channel 被复用会出错
+    if (state_ != State::kDisconnected && fd_ >= 0) {
         if (channel_) {
             channel_->disable_all();
             channel_->remove();
@@ -129,6 +128,12 @@ void Connection::handle_write() {
     // 全部写完了，关掉 EPOLLOUT 避免空转
     if (channel_->is_writing()) channel_->disable_writing();
 
+    // 半关延迟执行点：outbuf 排空后，若之前 shutdown() 设了 pending，现在真正关写端
+    if (shutdown_pending_) {
+        shutdown_pending_ = false;
+        ::shutdown(fd_, SHUT_WR);
+    }
+
     // 通知"buffer 已排空"。注意进到这里就一定意味着 readable_bytes() == 0：
     //   - 入口若 buffer 为空已经 return 了
     //   - while 循环只有把 buffer 写干净才会自然退出（出错/EAGAIN 都在内部 return 掉了）
@@ -187,6 +192,29 @@ void Connection::send(std::string_view data) {
         if (!channel_->is_writing()) {
             channel_->enable_writing();
         }
+    }
+}
+
+// ---------- 半关 ----------
+void Connection::shutdown() {
+    // 跨线程安全：与 send/close 一致，走 run_in_loop
+    if (state_ == State::kConnected) {
+        state_ = State::kDisconnecting;
+        loop_->run_in_loop([self = shared_from_this()]() { self->shutdown_in_loop(); });
+    }
+}
+
+void Connection::shutdown_in_loop() {
+    loop_->assert_in_loop_thread();
+    // 可能在 run_in_loop 排队期间被 close 了
+    if (state_ == State::kDisconnected) return;
+
+    if (output_buffer_.empty()) {
+        // outbuf 已空，立刻关写端
+        ::shutdown(fd_, SHUT_WR);
+    } else {
+        // outbuf 还有数据，等 handle_write() 写完后再关
+        shutdown_pending_ = true;
     }
 }
 

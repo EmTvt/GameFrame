@@ -75,7 +75,7 @@ void schedule_flush(EventLoop* loop, std::weak_ptr<LogFile> weak_log) {
 int main(int argc, char* argv[]) {
     // 简单参数：端口、日志目录、滚动大小
     // basedir 不存在时 LogFile 会自动 mkdir -p，不需要外部预创建
-    uint16_t port = 9000;
+    uint16_t port = 9099;
     std::string basedir = "./res/log";
     std::string basename = "epoll_proj";
     std::size_t roll_size = 10 * 1024 * 1024;   // 10 MiB：单文件写满即翻号到下一个 .log.N

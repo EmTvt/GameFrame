@@ -96,18 +96,24 @@ void LogSender::stop_in_loop() {
 
     // 2) 最后一次 drain + send：尽量把队列里的东西在断开前送出去
     //    paused_ 状态下也强行试一把：调用方主动 stop，剩余消息留在 output_buffer_
-    //    交给 Connection 自己排空（disconnect 不会瞬间断开，会等 close 流程走完）
-    //    没连上则跳过，没法兜
+    //    交给 Connection 自己排空。没连上则跳过，没法兜
     if (connection_ && connection_->connected()) {
         do_drain_and_send();
     }
 
-    // 3) 断开 TcpClient（这一步会让 retry_enabled_ = false，不会再自动重连）
+    // 3) 优雅半关：shutdown(SHUT_WR) 让 output_buffer_ 中剩余数据排空后才真正关写端。
+    //    这修复了之前 disconnect() 硬关时 outbuf 未排空会丢数据的 bug。
+    //    shutdown 之后对端（log_server）会收到 EOF，触发正常的连接关闭流程。
+    if (connection_) {
+        connection_->shutdown();
+    }
+
+    // 4) 断开 TcpClient（设 retry_enabled_=false，不会再自动重连）
     //    然后**在 loop 线程里**销毁 tcp_client_ —— TcpClient::~TcpClient 第一行
     //    会 assert_in_loop_thread，必须在这里跑，不能等 LogSender 在 main 线程析构
     //    时再 reset
     tcp_client_->disconnect();
-    connection_.reset();    // disconnect 之后 close_cb 已经清过一次，这里幂等
+    connection_.reset();
     tcp_client_.reset();    // ←关键：在 sender_loop_ 线程销毁 TcpClient
 }
 

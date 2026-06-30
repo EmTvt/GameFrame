@@ -38,6 +38,7 @@ class Connection : public std::enable_shared_from_this<Connection> {
 public:
     enum class State {
         kConnected,
+        kDisconnecting,   // 半关状态：写端已 shutdown 或 pending
         kDisconnected,
     };
 
@@ -129,9 +130,19 @@ public:
     void send(std::string_view data);
 
     // 主动关闭（也会被 read=0 / 出错时内部调用）
+    // 语义：立即双向关，不管 output_buffer_ 里有没有未发完的数据。
     void close();
 
+    // 优雅半关（shutdown 写端）：
+    //   - 若 output_buffer_ 已空 → 立刻 ::shutdown(fd_, SHUT_WR)
+    //   - 若 output_buffer_ 非空 → 置 shutdown_pending_ 标志，等 handle_write()
+    //     把数据写完后再执行 ::shutdown(SHUT_WR)
+    // 半关后：不再向对端写入，仍可读（等对端 FIN）。
+    // 跨线程安全：内部走 run_in_loop。
+    void shutdown();
+
 private:
+    void shutdown_in_loop();
     EventLoop* loop_;
     int fd_;
     std::string peer_;
@@ -152,6 +163,10 @@ private:
     HighWaterMarkCallback high_water_cb_;
     WriteCompleteCallback write_complete_cb_;
     size_t high_water_mark_ = 0;
+
+    // 半关标志：shutdown() 时 outbuf 非空，标记为 true；
+    // handle_write() 写空 outbuf 后检查此标志，再补 ::shutdown(SHUT_WR)
+    bool shutdown_pending_ = false;
 
     // 业务上下文 —— 类型擦除，由业务通过 set_context<T>/context<T>() 使用
     std::shared_ptr<void> context_;
