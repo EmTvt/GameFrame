@@ -282,7 +282,131 @@ public:
 
 ### 走完之后
 
-Task 9+10+11（+ Task 8 协程）合起来，epoll_proj 就具备一个**轻量游戏后台骨架**：事件驱动 I/O + 固定帧 tick + proto 路由 + 会话管理 + 协程异步逻辑。再往后才是「分网关/逻辑进程、接 DB、热重载、监控」这些生产级特性——那已超出本教学项目范围，按需再说。
+Task 9+10+11（+ Task 8 协程）合起来，epoll_proj 就具备一个**轻量游戏后台骨架**：事件驱动 I/O + 固定帧 tick + proto 路由 + 会话管理 + 协程异步逻辑。接下来进入**游戏后台框架**阶段，接入 DB、实现玩家数据管理、奖励系统等。
+
+---
+
+## 游戏后台框架阶段（Task 9~11 完成后的目标）
+
+> 前置依赖：Task 8（协程）+ Task 9（proto 路由）+ Task 10（game tick）+ Task 11（会话管理）全部完成。
+> 数据库选型：**MongoDB**（文档型 KV，schema-free，天然适配游戏"按玩家ID整存整取"的访问模式）。
+> 核心设计哲学：**内存为真相，DB 为持久化备份**——玩家在线期间纯内存操作，定时/下线异步落盘 MongoDB。
+
+### Task 12. MongoDB 异步接入层：DB 线程池 + 协程 co_await ⬜
+
+**文件**：`db/`（新目录）：`db_thread_pool.{h,cpp}`、`mongo_client.{h,cpp}`、`db_task.h`
+
+**职责**：实现异步 DB 访问层，逻辑线程绝不直接操作 DB。
+
+**架构**：
+```
+gameLoop（逻辑线程，单线程无锁）
+    │ 提交 DbTask / co_await db_query(...)
+    ▼
+DbThreadPool（N 个线程，每线程持有独立 mongoc_client_t）
+    │ 执行 MongoDB 操作
+    ▼
+完成后 queue_in_loop 回调 / resume 协程 → 回到 gameLoop
+```
+
+**要点**：
+- 依赖 `libmongoc`（MongoDB 官方 C 驱动）或 `mongocxx`（C++ 驱动）。CMake `find_package(mongoc-1.0)` 或 `find_package(mongocxx)`。
+- `DbThreadPool` 复用已有的 `MPSCQueue` 思路：gameLoop push 任务，DB 线程 drain 执行。
+- 每个 DB 线程持有独立的 `mongoc_client_t`（MongoDB 连接非线程安全，一线程一连接）。
+- 结果回调通过 `queue_in_loop` 投递回 gameLoop（与 LogSender 模式一致）。
+- 协程接口：`co_await db_load(player_id)` / `co_await db_save(player_id, data)`，底层提交 DbTask + 挂起协程，完成后 resume。
+- 连接池配置：连接串、DB 名、超时、重试策略通过 `DbConfig` 结构体传入。
+
+**验收**：gameLoop 中 `co_await db_save(...)` 写入一条文档到 MongoDB，`co_await db_load(...)` 读回并验证一致；DB 线程阻塞不影响 gameLoop 的 tick 和网络 I/O。
+
+### Task 13. 玩家数据管理：PlayerManager + 内存模型 + 定时落盘 ⬜
+
+**文件**：`game/player.{h,cpp}`、`game/player_manager.{h,cpp}`
+
+**职责**：管理在线玩家对象的完整生命周期（Load → 内存操作 → Save），实现"内存为真相"模型。
+
+**数据模型**（MongoDB 文档结构）：
+```json
+{
+    "_id": "player_10001",
+    "name": "张三",
+    "level": 15,
+    "vip": 3,
+    "resources": { "diamond": 1200, "gold": 58000, "energy": 120 },
+    "bag": { "items": [ {"id": 1001, "count": 5}, {"id": 2003, "count": 1} ] },
+    "tasks": { ... },
+    "social": { ... },
+    "data_version": 2,
+    "last_save": "2026-06-29T12:00:00Z"
+}
+```
+
+**要点**：
+- `Player` 对象：内存中的玩家数据实体，提供业务接口（加金币、扣体力等），内部维护 `dirty` 标志。
+- `PlayerManager`：
+  - `load_player(player_id)` → co_await 从 MongoDB 加载 → 反序列化为 Player 对象 → 存入 `online_players_` map。
+  - `save_player(player_id)` → 序列化 Player → co_await 写入 MongoDB → 清 dirty 标志。
+  - `save_all_dirty()` → 遍历所有 dirty 玩家，批量提交 Save 任务。
+- 定时落盘：在 gameLoop 上挂 `run_every(5min, save_all_dirty)`（复用 Task 10）。
+- 下线落盘：close_cb 触发时立即 Save 该玩家。
+- 序列化方案：Player ↔ BSON 文档（mongocxx 原生支持），或 Player ↔ protobuf → BSON binary。
+- 数据版本迁移：`data_version` 字段，Load 时检测版本差异并执行迁移逻辑。
+
+**验收**：玩家登录 → Load 到内存 → 修改属性 → 定时/下线 Save → 重新登录数据一致；模拟进程崩溃后重启，最多丢一个落盘周期的数据。
+
+### Task 14. 奖励发放系统：统一接口 + 策略路由 ⬜
+
+**文件**：`game/reward/reward_dispatcher.{h,cpp}`、`game/reward/reward_handler_*.{h,cpp}`
+
+**职责**：实现多级分发策略，根据奖励类型路由到对应子模块。
+
+**架构**：
+```
+RewardDispatcher（统一入口）
+    │ 按 reward_type 路由
+    ├── ResourceHandler（基础资源：金币/钻石/体力/爱心）
+    ├── ItemHandler（道具：加入背包）
+    ├── EquipHandler（装备：生成唯一实例）
+    └── ActivityHandler（活动道具：带过期时间）
+```
+
+**要点**：
+- 统一接口：`RewardDispatcher::grant(Player&, RewardList)` → 遍历奖励列表，按类型分发。
+- 策略注册：`register_handler(RewardType, Handler*)`，运行时可扩展。
+- 事务性：一批奖励要么全部发放成功，要么全部回滚（先预检再执行）。
+- 日志审计：每次发放记录流水（类型、数量、来源、时间），用于对账。
+- 与 Player 内存模型配合：发放只修改内存中的 Player 对象（标记 dirty），不直接操作 DB。
+
+**验收**：定义一个"通关奖励"（含金币+道具+体力），调用 `grant()` 后 Player 内存数据正确变更；背包溢出时整批回滚。
+
+### Task 15. 静态配置管理：Excel 转导 + 热重载 ⬜
+
+**文件**：`config/`（新目录）：`config_manager.{h,cpp}`、`config_loader.{h,cpp}`；`tools/excel2json.py`（转导脚本）
+
+**职责**：实现策划 Excel → JSON/二进制 → C++ 内存结构的配置流转管线。
+
+**流转机制**：
+```
+策划 Excel (.xlsx)
+    │ tools/excel2json.py 转导
+    ▼
+JSON 配置文件 (data/*.json)
+    │ ConfigManager::load() 启动时加载
+    ▼
+C++ 内存结构 (std::unordered_map<int, ItemConfig> 等)
+    │ 业务代码只读访问
+    ▼
+热重载：收到 reload 信号/GM命令 → 重新 load → 原子替换 shared_ptr
+```
+
+**要点**：
+- 转导脚本：Python 读 xlsx（openpyxl），按 sheet 生成 JSON；支持类型标注行（int/float/string/array）。
+- `ConfigManager`：持有所有配置表的 `shared_ptr<const XxxConfigTable>`，业务通过 `ConfigManager::get<ItemConfigTable>()` 只读访问。
+- 热重载：`reload()` 加载新文件 → 构建新 table → `atomic_store` 替换 shared_ptr（读者无锁，RCU 思路）。
+- 配置校验：load 时检查必填字段、外键引用（如道具ID是否存在）、数值范围。
+- 与奖励系统配合：`ItemConfig` 表定义道具属性（类型、堆叠上限、品质等），`RewardHandler` 查表决定发放逻辑。
+
+**验收**：从 Excel 转导出 JSON → 启动加载到内存 → 业务代码查表获取道具配置 → 运行时 reload 新配置生效且不影响正在处理的请求。
 
 ---
 

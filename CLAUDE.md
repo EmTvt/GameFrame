@@ -24,6 +24,7 @@ The core modules are:
 - `docs/NEXT_TASKS.md` — 下一步要做什么（每会话更新）
 - `docs/DECISIONS.md` — 历次设计决策的追加日志
 - `docs/DEBUGGING.md` — 踩过的坑、调试技巧
+- `docs/INTERVIEW.md` — 面试介绍指南：整体架构 + 难点专题（问题→方案→效果→可追问）+ 追问清单
 
 ## Build / test commands
 
