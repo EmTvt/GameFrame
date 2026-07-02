@@ -137,3 +137,15 @@ target_include_directories(test_logging PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(test_logging PRIVATE Threads::Threads)
+
+# ---- HTTP Server demo ----
+add_executable(http_server
+    http/http_demo_main.cpp
+    http/http_server.cpp
+    ${EPOLL_NET_SOURCES}
+)
+target_include_directories(http_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+target_link_libraries(http_server PRIVATE Threads::Threads)

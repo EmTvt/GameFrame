@@ -83,6 +83,19 @@ public:
         return s;
     }
 
+    // 消费至指定位置（end 必须在 [peek(), peek()+readable_bytes()] 范围内）
+    void retrieve_until(const char* end) {
+        retrieve(static_cast<size_t>(end - peek()));
+    }
+
+    // 在可读数据中搜索 \r\n，返回指向 '\r' 的指针；找不到返回 nullptr
+    const char* find_crlf() const {
+        const char* begin = peek();
+        const char* end = begin + readable_bytes();
+        const char* found = std::search(begin, end, kCRLF, kCRLF + 2);
+        return found == end ? nullptr : found;
+    }
+
     // 清空（仅重置游标，不释放内存）
     void retrieve_all() {
         reader_index_ = kPrependSize;
@@ -112,6 +125,8 @@ public:
     }
 
 private:
+    static constexpr char kCRLF[] = "\r\n";
+
     std::vector<char> data_;
     size_t reader_index_;
     size_t writer_index_;

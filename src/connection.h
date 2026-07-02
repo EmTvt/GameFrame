@@ -141,6 +141,11 @@ public:
     // 跨线程安全：内部走 run_in_loop。
     void shutdown();
 
+    // 延迟强制关闭：给对端 delay_ms 毫秒读剩余数据，到点无论如何都 close()。
+    // 典型场景：HTTP 错误响应写完后给客户端几百毫秒读完再关、限流踢人等。
+    // 用 weak_ptr 避免定时器延长 Connection 寿命：若到点前已被其他路径 close 则 no-op。
+    void force_close_with_delay(int64_t delay_ms);
+
 private:
     void shutdown_in_loop();
     EventLoop* loop_;

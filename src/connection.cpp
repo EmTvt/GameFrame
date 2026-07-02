@@ -247,4 +247,17 @@ void Connection::close() {
     }
 }
 
+// ---------- 延迟强制关 ----------
+void Connection::force_close_with_delay(int64_t delay_ms) {
+    if (state_ == State::kDisconnected) return;
+
+    // weak_ptr：到点时若 Connection 已析构则 lock() 返回 nullptr，安全跳过
+    std::weak_ptr<Connection> weak_self = shared_from_this();
+    loop_->run_after(delay_ms, [weak_self]() {
+        if (auto conn = weak_self.lock()) {
+            conn->close();
+        }
+    });
+}
+
 }  // namespace epoll_proj
