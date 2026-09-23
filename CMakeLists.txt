@@ -6,7 +6,7 @@ project(epoll_proj LANGUAGES CXX)
 # C++ 标准
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_CXX_EXTENSIONS ON)
 
 # 默认 Debug 构建（带调试符号），方便 VSCode 调试
 if(NOT CMAKE_BUILD_TYPE)
@@ -149,3 +149,15 @@ target_include_directories(http_server PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 target_link_libraries(http_server PRIVATE Threads::Threads)
+
+# ---- 测试：RpcCodec 内层帧编解码（RPC-1）----
+# rpc/rpc_message.h 是纯头文件、无状态，Buffer / LengthPrefixedCodec 同理，
+# 所以这个 target 不需要任何 .cpp、也不需要 pthread —— 编译隔离到极致，
+# 跑得快，且能证明"RPC 内层协议不依赖网络层"这个分层事实。
+add_executable(test_rpc_codec
+    test_rpc_codec.cpp
+)
+target_include_directories(test_rpc_codec PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
